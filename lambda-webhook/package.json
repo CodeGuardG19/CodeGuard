@@ -1,0 +1,28 @@
+{
+  "name": "codeguard-webhook-handler",
+  "version": "1.0.0",
+  "description": "CodeGuard Lambda webhook handler — validates GitHub webhooks and dispatches SAST scans",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --experimental-vm-modules node_modules/.bin/jest --coverage",
+    "lint": "eslint src/ test/"
+  },
+  "dependencies": {
+    "@aws-sdk/client-lambda": "^3.600.0",
+    "@aws-sdk/client-s3": "^3.600.0",
+    "@aws-sdk/client-sns": "^3.600.0",
+    "@aws-sdk/client-ssm": "^3.600.0",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": ["**/test/**/*.test.js"],
+    "collectCoverageFrom": ["src/**/*.js"]
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

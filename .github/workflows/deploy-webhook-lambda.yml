@@ -1,0 +1,90 @@
+name: Deploy Webhook Lambda
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "lambda-webhook/**"
+
+permissions:
+  id-token: write   # required for OIDC token exchange
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO_NAME: codeguard-webhook-handler
+  WEBHOOK_LAMBDA_NAME: codeguard-webhook-handler
+
+jobs:
+  deploy:
+    name: Build, push, and deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Authenticate to AWS via OIDC — no long-lived credentials stored anywhere.
+      # GHA_DEPLOY_ROLE_ARN is a GitHub Actions variable (not a secret) because
+      # it contains no sensitive data; the trust policy restricts it to this repo
+      # and the main branch only.
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.GHA_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set ECR URI
+        id: ecr-uri
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "uri=${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO_NAME }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            -t "${{ steps.ecr-uri.outputs.uri }}:latest" \
+            -t "${{ steps.ecr-uri.outputs.uri }}:${{ github.sha }}" \
+            lambda-webhook/
+
+      - name: Push image to ECR (latest + sha tags)
+        run: |
+          docker push "${{ steps.ecr-uri.outputs.uri }}:latest"
+          docker push "${{ steps.ecr-uri.outputs.uri }}:${{ github.sha }}"
+
+      - name: Update Lambda to new image
+        run: |
+          aws lambda update-function-code \
+            --function-name "${{ env.WEBHOOK_LAMBDA_NAME }}" \
+            --image-uri "${{ steps.ecr-uri.outputs.uri }}:${{ github.sha }}" \
+            --region "${{ env.AWS_REGION }}"
+
+      - name: Wait for Lambda update to complete
+        run: |
+          aws lambda wait function-updated \
+            --function-name "${{ env.WEBHOOK_LAMBDA_NAME }}" \
+            --region "${{ env.AWS_REGION }}"
+
+      - name: Smoke test — invoke with warm-up payload and assert 200
+        run: |
+          RESPONSE=$(aws lambda invoke \
+            --function-name "${{ env.WEBHOOK_LAMBDA_NAME }}" \
+            --payload '{"source":"aws.events","detail-type":"warmup"}' \
+            --cli-binary-format raw-in-base64-out \
+            --region "${{ env.AWS_REGION }}" \
+            /tmp/lambda-response.json \
+            --query 'StatusCode' --output text)
+
+          echo "Lambda status code: ${RESPONSE}"
+          cat /tmp/lambda-response.json
+
+          if [ "${RESPONSE}" != "200" ]; then
+            echo "Smoke test FAILED — expected 200, got ${RESPONSE}"
+            exit 1
+          fi
+          echo "Smoke test passed."
