@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# 03-ec2.sh — Launches EC2 (Amazon Linux 2023) in public subnet, installs Nginx,
-#             configures it as a reverse proxy to Lambda Function URL, and assigns
-#             an Elastic IP. No SSH key pair — access is SSM Session Manager only.
+# 03-ec2.sh — Launches EC2 (Amazon Linux 2023 kernel 6.1, t3.micro) in public
+#             subnet, installs Nginx, configures it as a reverse proxy to Lambda
+#             Function URL, and assigns an Elastic IP.
+#             No SSH key pair — access is SSM Session Manager only.
+#             Uses the pre-provisioned LabRole / LabInstanceProfile (course env).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,10 +15,12 @@ STATE_FILE="${SCRIPT_DIR}/state.env"
 log()  { echo "[03-ec2] $*"; }
 save() { echo "export $1=\"$2\"" >> "${STATE_FILE}"; }
 
-# ── Resolve latest Amazon Linux 2023 AMI ─────────────────────────────────────
-log "Resolving Amazon Linux 2023 AMI..."
+# ── Resolve Amazon Linux 2023 kernel 6.1 AMI ─────────────────────────────────
+# Pins to kernel 6.1 as required. SSM always returns the latest patch of that
+# kernel line so you get security updates without changing the kernel major version.
+log "Resolving Amazon Linux 2023 kernel-6.1 AMI..."
 EC2_AMI_ID=$(aws ssm get-parameter \
-  --name "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64" \
+  --name "${EC2_AMI_SSM_PATH}" \
   --region "${AWS_REGION}" \
   --query 'Parameter.Value' --output text)
 log "AMI: ${EC2_AMI_ID}"
@@ -61,13 +65,15 @@ USERDATA
 )
 
 # ── Launch EC2 instance ───────────────────────────────────────────────────────
-log "Launching EC2 instance (${EC2_INSTANCE_TYPE})..."
+# Uses LabInstanceProfile — the pre-provisioned course role that already has
+# SSM Session Manager and CloudWatch Agent permissions attached.
+log "Launching EC2 instance (${EC2_INSTANCE_TYPE}, AL2023 kernel 6.1)..."
 INSTANCE_ID=$(aws ec2 run-instances \
   --image-id "${EC2_AMI_ID}" \
   --instance-type "${EC2_INSTANCE_TYPE}" \
   --subnet-id "${PUBLIC_SUBNET_ID}" \
   --security-group-ids "${EC2_SG_ID}" \
-  --iam-instance-profile Name="${EC2_INSTANCE_PROFILE}" \
+  --iam-instance-profile Name="${LAB_INSTANCE_PROFILE}" \
   --user-data "${USER_DATA}" \
   --no-associate-public-ip-address \
   --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \

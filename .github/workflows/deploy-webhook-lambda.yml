@@ -1,10 +1,16 @@
 name: Deploy Webhook Lambda
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "lambda-webhook/**"
+  # GitHub Actions OIDC cannot be used in AWS Academy Learner Lab because
+  # iam:UpdateAssumeRolePolicy is explicitly denied on LabRole by the lab policy.
+  # Lambda deployments are done manually from the Lab terminal via 04-lambda.sh.
+  # This workflow is kept as documentation of the intended CI/CD design.
+  # To re-enable: uncomment the push trigger below and configure OIDC in a real AWS account.
+  workflow_dispatch:   # manual trigger only — can be run from GitHub UI if needed
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - "lambda-webhook/**"
 
 permissions:
   id-token: write   # required for OIDC token exchange
@@ -28,6 +34,12 @@ jobs:
       # GHA_DEPLOY_ROLE_ARN is a GitHub Actions variable (not a secret) because
       # it contains no sensitive data; the trust policy restricts it to this repo
       # and the main branch only.
+      #
+      # Lab environment note: set GHA_DEPLOY_ROLE_ARN to the LabRole ARN:
+      #   arn:aws:iam::<ACCOUNT_ID>:role/LabRole
+      # LabRole must have its trust policy updated to allow GitHub Actions OIDC:
+      #   Principal: {"Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com"}
+      #   Condition: sub = "repo:CodeGuardG19/CodeGuard:ref:refs/heads/main"
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:

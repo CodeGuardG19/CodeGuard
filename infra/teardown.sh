@@ -103,36 +103,10 @@ if [ -n "${EC2_EIP_ALLOC_ID:-}" ]; then
 fi
 
 # ── IAM ───────────────────────────────────────────────────────────────────────
-step "Deleting IAM roles and policies..."
-
-aws iam delete-role-policy \
-  --role-name codeguard-lambda-webhook-role \
-  --policy-name codeguard-lambda-webhook-policy 2>/dev/null || true
-aws iam detach-role-policy \
-  --role-name codeguard-lambda-webhook-role \
-  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole 2>/dev/null || true
-aws iam delete-role \
-  --role-name codeguard-lambda-webhook-role 2>/dev/null && ok "Lambda role deleted" || fail "Lambda role"
-
-aws iam remove-role-from-instance-profile \
-  --instance-profile-name codeguard-ec2-instance-profile \
-  --role-name codeguard-ec2-ssm-role 2>/dev/null || true
-aws iam delete-instance-profile \
-  --instance-profile-name codeguard-ec2-instance-profile 2>/dev/null || true
-aws iam detach-role-policy \
-  --role-name codeguard-ec2-ssm-role \
-  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore 2>/dev/null || true
-aws iam detach-role-policy \
-  --role-name codeguard-ec2-ssm-role \
-  --policy-arn arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy 2>/dev/null || true
-aws iam delete-role \
-  --role-name codeguard-ec2-ssm-role 2>/dev/null && ok "EC2 role deleted" || fail "EC2 role"
-
-aws iam delete-role-policy \
-  --role-name codeguard-gha-deploy-role \
-  --policy-name codeguard-gha-deploy-policy 2>/dev/null || true
-aws iam delete-role \
-  --role-name codeguard-gha-deploy-role 2>/dev/null && ok "GHA role deleted" || fail "GHA role"
+# LabRole and LabInstanceProfile are pre-provisioned by the course environment
+# and are NOT deleted — we did not create them and do not own them.
+step "Skipping IAM role deletion (LabRole is course-managed, not created by us)"
+ok "IAM roles skipped"
 
 # ── NAT Gateway and NAT EIP ───────────────────────────────────────────────────
 if [ -n "${NAT_GW_ID:-}" ]; then
