@@ -49,12 +49,18 @@ aws ec2 authorize-security-group-ingress \
   --group-id "${EC2_SG_ID}" \
   --protocol tcp --port 80 --cidr "0.0.0.0/0"
 
-# Outbound: only to the private subnet (forward to Lambda Function URL via VPC)
+# Outbound: HTTPS to anywhere — needed for SSM agent, Certbot, and dnf package updates.
+# The Lambda Function URL (in private subnet) is also HTTPS so this covers that too.
+# We keep port 80 out for Certbot HTTP-01 challenge and dnf mirrors.
 aws ec2 authorize-security-group-egress \
   --group-id "${EC2_SG_ID}" \
-  --protocol tcp --port 443 --cidr "${PRIVATE_SUBNET_CIDR}"
+  --protocol tcp --port 443 --cidr "0.0.0.0/0"
 
-# Remove the default allow-all outbound rule AWS adds automatically
+aws ec2 authorize-security-group-egress \
+  --group-id "${EC2_SG_ID}" \
+  --protocol tcp --port 80 --cidr "0.0.0.0/0"
+
+# Remove the default allow-all (-1) egress rule AWS adds, leaving only our scoped rules
 aws ec2 revoke-security-group-egress \
   --group-id "${EC2_SG_ID}" \
   --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]' \

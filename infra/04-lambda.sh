@@ -41,6 +41,7 @@ aws ecr get-login-password --region "${AWS_REGION}" \
 log "Building Docker image..."
 docker build \
   --platform linux/amd64 \
+  --provenance=false \
   -t "${ECR_REPO_URI}:latest" \
   "${LAMBDA_DIR}"
 
@@ -172,7 +173,7 @@ WARMUP_RULE_ARN=$(aws events put-rule \
 
 aws events put-targets \
   --rule codeguard-lambda-warmup \
-  --targets "Id=WebhookHandlerWarmup,Arn=${WEBHOOK_LAMBDA_ARN},Input={\"source\":\"aws.events\",\"detail-type\":\"warmup\"}" \
+  --targets "[{\"Id\":\"WebhookHandlerWarmup\",\"Arn\":\"${WEBHOOK_LAMBDA_ARN}\",\"Input\":\"{\\\"source\\\":\\\"aws.events\\\",\\\"detail-type\\\":\\\"warmup\\\"}\"}]" \
   --region "${AWS_REGION}"
 
 aws lambda add-permission \
@@ -204,7 +205,7 @@ RETRY_RULE_ARN=$(aws events put-rule \
 
 aws events put-targets \
   --rule codeguard-scan-failed-retry \
-  --targets "Id=WebhookHandlerRetry,Arn=${WEBHOOK_LAMBDA_ARN}" \
+  --targets "[{\"Id\":\"WebhookHandlerRetry\",\"Arn\":\"${WEBHOOK_LAMBDA_ARN}\"}]" \
   --region "${AWS_REGION}"
 
 aws lambda add-permission \

@@ -18,7 +18,7 @@ CodeGuard is a cloud-native SAST (Static Application Security Testing) pipeline 
 ### Step 1 — Clone the repository
 
 ```bash
-git clone https://github.com/<your-org>/CodeGuard.git
+git clone https://github.com/CodeGuardG19/CodeGuard.git
 cd CodeGuard
 git checkout main
 ```
@@ -48,6 +48,9 @@ Everything else is pre-configured with sensible defaults.
 CodeGuard reads two secrets from AWS Systems Manager Parameter Store at runtime — they are never stored in code or environment variables.
 
 ```bash
+# Use random strings for both of these, you can create one by running this command:
+openssl rand -hex 32
+
 # GitHub Webhook Secret — any random string you choose (set the same value in GitHub)
 aws ssm put-parameter \
   --name "/codeguard/github-webhook-secret" \
@@ -62,6 +65,8 @@ aws ssm put-parameter \
 ```
 
 ### Step 5 — Deploy
+
+Make sure Docker Desktop is up and running. Then:
 
 ```bash
 chmod +x deploy.sh
@@ -90,6 +95,7 @@ In the target GitHub repository:
 ### Step 7 — Confirm SNS subscription
 
 Check `NOTIFICATION_EMAIL` inbox and click **Confirm subscription** in the AWS email.
+Check your inbox or the spam folder to confirm subscription.
 
 ### Teardown
 

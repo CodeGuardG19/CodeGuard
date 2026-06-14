@@ -55,6 +55,7 @@ aws ecr get-login-password --region "${AWS_REGION}" \
 log "Building SAST Scanner Docker image (linux/amd64)..."
 docker build \
   --platform linux/amd64 \
+  --provenance=false \
   -t "${SCANNER_ECR_URI}:latest" \
   "${SCANNER_DIR}"
 
@@ -141,7 +142,7 @@ SCANNER_WARMUP_RULE_ARN=$(aws events put-rule \
 
 aws events put-targets \
   --rule codeguard-scanner-warmup \
-  --targets "Id=SastScannerWarmup,Arn=${SCANNER_LAMBDA_ARN},Input={\"source\":\"aws.events\",\"detail-type\":\"warmup\"}" \
+  --targets "[{\"Id\":\"SastScannerWarmup\",\"Arn\":\"${SCANNER_LAMBDA_ARN}\",\"Input\":\"{\\\"source\\\":\\\"aws.events\\\",\\\"detail-type\\\":\\\"warmup\\\"}\"}]" \
   --region "${AWS_REGION}"
 
 aws lambda add-permission \

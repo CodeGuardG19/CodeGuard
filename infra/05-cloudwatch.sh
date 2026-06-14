@@ -80,11 +80,13 @@ aws cloudwatch put-metric-alarm \
   --region "${AWS_REGION}"
 log "EC2 CPU alarm created."
 
-# ── CloudWatch Agent: install and configure on EC2 ───────────────────────────
-log "Pushing CloudWatch agent config to EC2 via SSM..."
+# ── CloudWatch Agent: store config in SSM Parameter Store, fetch from EC2 ────
+# Embedding JSON in --parameters causes quoting failures. Instead:
+#   1. Write the config to SSM Parameter Store from this script (no quoting issues)
+#   2. Tell the CW agent on EC2 to fetch it directly from SSM (AWS-recommended pattern)
+log "Writing CloudWatch agent config to SSM Parameter Store..."
 
-CW_AGENT_CONFIG=$(cat <<'CWCONFIG'
-{
+CW_AGENT_CONFIG='{
   "agent": {
     "metrics_collection_interval": 60,
     "run_as_user": "cwagent"
@@ -131,20 +133,23 @@ CW_AGENT_CONFIG=$(cat <<'CWCONFIG'
       }
     }
   }
-}
-CWCONFIG
-)
+}'
 
+CW_AGENT_SSM_PARAM="/codeguard/cw-agent-config"
+
+aws ssm put-parameter \
+  --name "${CW_AGENT_SSM_PARAM}" \
+  --value "${CW_AGENT_CONFIG}" \
+  --type String \
+  --overwrite \
+  --region "${AWS_REGION}"
+log "CW agent config stored at SSM parameter: ${CW_AGENT_SSM_PARAM}"
+
+log "Instructing EC2 to fetch CW agent config from SSM and start agent..."
 SSM_CMD_ID=$(aws ssm send-command \
   --instance-ids "${EC2_INSTANCE_ID}" \
   --document-name "AWS-RunShellScript" \
-  --parameters "commands=[
-    \"mkdir -p /opt/aws/amazon-cloudwatch-agent/etc\",
-    \"cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CWEOF'\n${CW_AGENT_CONFIG}\nCWEOF\",
-    \"/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s\",
-    \"systemctl enable amazon-cloudwatch-agent\",
-    \"systemctl start amazon-cloudwatch-agent\"
-  ]" \
+  --parameters '{"commands":["systemctl enable amazon-cloudwatch-agent","systemctl stop amazon-cloudwatch-agent || true","/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c ssm:/codeguard/cw-agent-config -s"]}' \
   --region "${AWS_REGION}" \
   --query 'Command.CommandId' --output text)
 
