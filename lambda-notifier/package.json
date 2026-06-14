@@ -1,0 +1,12 @@
+{
+  "name": "codeguard-notifier",
+  "version": "1.0.0",
+  "description": "CodeGuard Notifier Lambda — posts GitHub PR comments and SNS alerts",
+  "type": "module",
+  "main": "index.mjs",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.620.0",
+    "@aws-sdk/client-sns": "^3.620.0",
+    "@aws-sdk/client-ssm": "^3.620.0"
+  }
+}

@@ -14,16 +14,16 @@ log()  { echo "[04-lambda] $*"; }
 save() { echo "export $1=\"$2\"" >> "${STATE_FILE}"; }
 
 ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-ECR_REPO_URI="${ECR_REGISTRY}/${ECR_REPO_NAME}"
+ECR_REPO_URI="${ECR_REGISTRY}/${WEBHOOK_ECR_REPO}"
 LAMBDA_DIR="${SCRIPT_DIR}/../lambda-webhook"
 
 # ── ECR: create repository if it does not exist ───────────────────────────────
 log "Ensuring ECR repository exists..."
 if ! aws ecr describe-repositories \
-     --repository-names "${ECR_REPO_NAME}" \
+     --repository-names "${WEBHOOK_ECR_REPO}" \
      --region "${AWS_REGION}" &>/dev/null; then
   aws ecr create-repository \
-    --repository-name "${ECR_REPO_NAME}" \
+    --repository-name "${WEBHOOK_ECR_REPO}" \
     --image-scanning-configuration scanOnPush=true \
     --region "${AWS_REGION}" \
     --tags Key=Project,Value="${PROJECT_TAG}"
@@ -88,9 +88,9 @@ if [ -z "${EXISTING}" ]; then
     --code ImageUri="${ECR_REPO_URI}:latest" \
     --role "${LAMBDA_ROLE_ARN}" \
     --memory-size "${LAMBDA_MEMORY}" \
-    --timeout "${LAMBDA_TIMEOUT}" \
+    --timeout "${WEBHOOK_LAMBDA_TIMEOUT}" \
     --vpc-config "SubnetIds=${PRIVATE_SUBNET_ID},SecurityGroupIds=${LAMBDA_SG_ID}" \
-    --environment "Variables={S3_BUCKET_NAME=${S3_BUCKET_NAME},SAST_LAMBDA_NAME=${SAST_LAMBDA_NAME},AWS_REGION_NAME=${AWS_REGION},WEBHOOK_SECRET_PARAM=${WEBHOOK_SECRET_PARAM}}" \
+    --environment "Variables={S3_BUCKET_NAME=${S3_BUCKET_NAME},SAST_LAMBDA_NAME=${SAST_LAMBDA_NAME},AWS_REGION_NAME=${AWS_REGION},WEBHOOK_SECRET_PARAM=${WEBHOOK_SECRET_PARAM},SNS_TOPIC_ARN=${SNS_TOPIC_ARN}}" \
     --tags "Project=${PROJECT_TAG}" \
     --region "${AWS_REGION}"
 
@@ -113,9 +113,9 @@ else
   aws lambda update-function-configuration \
     --function-name "${WEBHOOK_LAMBDA_NAME}" \
     --memory-size "${LAMBDA_MEMORY}" \
-    --timeout "${LAMBDA_TIMEOUT}" \
+    --timeout "${WEBHOOK_LAMBDA_TIMEOUT}" \
     --vpc-config "SubnetIds=${PRIVATE_SUBNET_ID},SecurityGroupIds=${LAMBDA_SG_ID}" \
-    --environment "Variables={S3_BUCKET_NAME=${S3_BUCKET_NAME},SAST_LAMBDA_NAME=${SAST_LAMBDA_NAME},AWS_REGION_NAME=${AWS_REGION},WEBHOOK_SECRET_PARAM=${WEBHOOK_SECRET_PARAM}}" \
+    --environment "Variables={S3_BUCKET_NAME=${S3_BUCKET_NAME},SAST_LAMBDA_NAME=${SAST_LAMBDA_NAME},AWS_REGION_NAME=${AWS_REGION},WEBHOOK_SECRET_PARAM=${WEBHOOK_SECRET_PARAM},SNS_TOPIC_ARN=${SNS_TOPIC_ARN}}" \
     --region "${AWS_REGION}"
 
   aws lambda wait function-updated \

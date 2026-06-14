@@ -80,6 +80,8 @@ async function handleWebhook(event) {
     return { statusCode: 400, body: 'Missing repository or commit information' };
   }
 
+  const prNumber = payload.pull_request?.number ?? null;
+
   const jobId = uuidv4();
   const metadata = {
     jobId,
@@ -87,6 +89,7 @@ async function handleWebhook(event) {
     repo,
     commitSha,
     branch: branch || 'unknown',
+    prNumber,
     triggeredAt: new Date().toISOString(),
     retryCount: 0,
   };

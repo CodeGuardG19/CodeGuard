@@ -9,18 +9,21 @@ source "${SCRIPT_DIR}/state.env"
 
 log() { echo "[05-cloudwatch] $*"; }
 
-LOG_GROUP="/codeguard/lambda/webhook-handler"
-
-# ── Log group with 30-day retention ───────────────────────────────────────────
-log "Creating Lambda log group ${LOG_GROUP}..."
-aws logs create-log-group \
-  --log-group-name "${LOG_GROUP}" \
-  --region "${AWS_REGION}" 2>/dev/null || true
-aws logs put-retention-policy \
-  --log-group-name "${LOG_GROUP}" \
-  --retention-in-days 30 \
-  --region "${AWS_REGION}"
-log "Log group ready."
+# ── Lambda log groups with 30-day retention ───────────────────────────────────
+for LOG_GROUP in \
+  "/codeguard/lambda/webhook-handler" \
+  "/codeguard/lambda/sast-scanner" \
+  "/codeguard/lambda/notifier"; do
+  log "Creating log group ${LOG_GROUP}..."
+  aws logs create-log-group \
+    --log-group-name "${LOG_GROUP}" \
+    --region "${AWS_REGION}" 2>/dev/null || true
+  aws logs put-retention-policy \
+    --log-group-name "${LOG_GROUP}" \
+    --retention-in-days 30 \
+    --region "${AWS_REGION}"
+done
+log "Lambda log groups ready."
 
 # ── CloudWatch Alarm: Lambda error rate > 5% over 5 minutes ──────────────────
 # Uses the built-in Errors metric. Threshold is absolute count — we use a math
@@ -163,5 +166,37 @@ for LG in "/codeguard/ec2/nginx-access" "/codeguard/ec2/nginx-error"; do
     --region "${AWS_REGION}"
 done
 log "Nginx log groups created."
+
+# ── CloudWatch Alarms: SAST Scanner errors ───────────────────────────────────
+log "Creating scanner error alarm..."
+aws cloudwatch put-metric-alarm \
+  --alarm-name "codeguard-scanner-error-rate" \
+  --alarm-description "SAST scanner Lambda error rate exceeds threshold" \
+  --namespace "AWS/Lambda" \
+  --metric-name "Errors" \
+  --dimensions "Name=FunctionName,Value=${SAST_LAMBDA_NAME}" \
+  --statistic "Sum" \
+  --period 300 \
+  --evaluation-periods 1 \
+  --threshold 5 \
+  --comparison-operator "GreaterThanOrEqualToThreshold" \
+  --treat-missing-data "notBreaching" \
+  --region "${AWS_REGION}"
+
+# ── CloudWatch Alarms: Notifier errors ───────────────────────────────────────
+log "Creating notifier error alarm..."
+aws cloudwatch put-metric-alarm \
+  --alarm-name "codeguard-notifier-error-rate" \
+  --alarm-description "Notifier Lambda error rate exceeds threshold" \
+  --namespace "AWS/Lambda" \
+  --metric-name "Errors" \
+  --dimensions "Name=FunctionName,Value=${NOTIFIER_LAMBDA_NAME}" \
+  --statistic "Sum" \
+  --period 300 \
+  --evaluation-periods 1 \
+  --threshold 5 \
+  --comparison-operator "GreaterThanOrEqualToThreshold" \
+  --treat-missing-data "notBreaching" \
+  --region "${AWS_REGION}"
 
 log "05-cloudwatch.sh complete."

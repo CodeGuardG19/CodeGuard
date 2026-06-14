@@ -31,7 +31,7 @@ log "EC2_INSTANCE_PROFILE=${LAB_INSTANCE_PROFILE}"
 log "Creating EC2 security group..."
 EC2_SG_ID=$(aws ec2 create-security-group \
   --group-name codeguard-ec2-sg \
-  --description "CodeGuard EC2 Nginx proxy — inbound HTTPS only" \
+  --description "CodeGuard EC2 Nginx proxy - inbound HTTPS only" \
   --vpc-id "${VPC_ID}" \
   --region "${AWS_REGION}" \
   --query 'GroupId' --output text)
@@ -67,7 +67,7 @@ save EC2_SG_ID "${EC2_SG_ID}"
 log "Creating Lambda security group..."
 LAMBDA_SG_ID=$(aws ec2 create-security-group \
   --group-name codeguard-lambda-sg \
-  --description "CodeGuard Lambda webhook handler — no inbound, outbound via NAT only" \
+  --description "CodeGuard Lambda webhook handler - no inbound, outbound via NAT only" \
   --vpc-id "${VPC_ID}" \
   --region "${AWS_REGION}" \
   --query 'GroupId' --output text)
