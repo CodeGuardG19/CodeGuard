@@ -47,6 +47,8 @@ Everything else is pre-configured with sensible defaults.
 
 CodeGuard reads two secrets from AWS Systems Manager Parameter Store at runtime — they are never stored in code or environment variables.
 
+This should be run in the Learner Lab AWS CLI
+
 ```bash
 # Use random strings for both of these, you can create one by running this command:
 openssl rand -hex 32

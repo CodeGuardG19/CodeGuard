@@ -103,12 +103,6 @@ try "Scanner ECR repo" aws ecr delete-repository \
   --repository-name "${SCANNER_ECR_REPO:-codeguard-sast-scanner}" \
   --force --region "${AWS_REGION}"
 
-# ── SSM parameters ────────────────────────────────────────────────────────────
-step "Deleting SSM parameters..."
-try "Webhook secret param"  aws ssm delete-parameter --name "${WEBHOOK_SECRET_PARAM:-/codeguard/github-webhook-secret}" --region "${AWS_REGION}"
-try "CW agent config param" aws ssm delete-parameter --name "/codeguard/cw-agent-config"                                --region "${AWS_REGION}"
-try "GitHub token param"    aws ssm delete-parameter --name "${GITHUB_TOKEN_PARAM:-/codeguard/github-token}"            --region "${AWS_REGION}"
-
 # ── EC2 instance ──────────────────────────────────────────────────────────────
 if [ -n "${EC2_INSTANCE_ID:-}" ]; then
   step "Terminating EC2 instance ${EC2_INSTANCE_ID}..."
