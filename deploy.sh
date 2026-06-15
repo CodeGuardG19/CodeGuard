@@ -80,7 +80,7 @@ run_step "Lambda — Notifier + S3 trigger (Person C)" "${INFRA}/08-lambda-notif
 run_step "CloudWatch log groups and alarms" "${INFRA}/05-cloudwatch.sh"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
-source "${STATE_FILE}"
+source "${INFRA}/${STATE_FILE}"
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════════════╗"
