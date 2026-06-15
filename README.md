@@ -20,7 +20,7 @@ CodeGuard is a cloud-native SAST (Static Application Security Testing) pipeline 
 ```bash
 git clone https://github.com/CodeGuardG19/CodeGuard.git
 cd CodeGuard
-git checkout main
+git checkout <YOUR_NEW_BRANCH>
 ```
 
 ### Step 2 — Configure your AWS credentials
@@ -32,7 +32,7 @@ aws configure          # enter Access Key ID, Secret, region = us-east-1
 # OR export the env vars directly from the Learner Lab "AWS Details" panel
 ```
 
-### Step 3 — Edit `infra/config.env`
+### Step 3 — Edit `infra/config.env` (Run everytime a new session is started)
 
 Open `infra/config.env` and set **two values**:
 
@@ -77,31 +77,79 @@ The script takes 10–15 minutes. It prints a summary at the end:
 
 ```
 ╔═══════════════════════════════════════════════════════════╗
-║  Public webhook URL: https://<EC2-IP>/webhook             ║
+║  Public webhook URL: http://<EC2-IP>/webhook              ║
 ╚═══════════════════════════════════════════════════════════╝
 ```
 
 ### Step 6 — Configure GitHub webhook
 
-In the target GitHub repository:
+In the target GitHub repository, where you want this SAST scanner to run:
 
 1. Go to **Settings → Webhooks → Add webhook**
-2. Set **Payload URL** to `https://<EC2-IP>/webhook`
+2. Set **Payload URL** to `http://<EC2-IP>/webhook` (HTTP, not HTTPS — no TLS cert in Lab)
 3. Set **Content type** to `application/json`
-4. Set **Secret** to the value from Step 4
-5. Select events: **Pull requests** and **Pushes**
+4. Set **Secret** to the value you put in SSM in Step 4
+5. Under **Which events**, select **Let me select individual events** → check **Pull requests**
 6. Click **Add webhook**
+
+GitHub will immediately send a ping event. The webhook should show a green checkmark and a `202 Accepted` response. If it shows a red ✗, check that the EC2 Elastic IP is correct and nginx is running.
 
 ### Step 7 — Confirm SNS subscription
 
-Check `NOTIFICATION_EMAIL` inbox and click **Confirm subscription** in the AWS email.
-Check your inbox or the spam folder to confirm subscription.
+Check `NOTIFICATION_EMAIL` inbox and click **Confirm subscription** in the AWS email before testing — alerts will not be delivered until the subscription is confirmed. Check your spam folder if it does not arrive within a minute.
+
+### Step 8 — Trigger a scan with a pull request
+
+**1. Add a file with a detectable vulnerability to a new branch:**
+
+```bash
+# In a local clone of the target repo
+git checkout -b test/security-scan
+
+cat > test-vulnerable.js << 'EOF'
+// Intentional vulnerabilities for CodeGuard demo
+const password = "supersecret123";          // HARDCODED_SECRET
+const query = "SELECT * FROM users WHERE id = " + userId;  // SQL_INJECTION
+eval(userInput);                            // INSECURE_FUNCTION
+EOF
+
+git add test-vulnerable.js
+git commit -m "test: add file to trigger CodeGuard scan"
+git push origin test/security-scan
+```
+
+**2. Open a pull request** on GitHub: `test/security-scan` → `main`
+
+**3. What happens next (automatically):**
+
+| Time | Event |
+|------|-------|
+| 0 s | GitHub fires a `pull_request` webhook to the EC2 endpoint |
+| ~1 s | EC2 proxy forwards it to the Webhook Handler Lambda; GitHub receives `202 Accepted` |
+| ~2 s | Webhook Handler verifies HMAC, creates a job record in S3, invokes the SAST Scanner |
+| ~30–60 s | SAST Scanner downloads the repo, runs the rule engine, writes the report to S3 |
+| ~60–90 s | Notifier Lambda reads the report, posts a comment on the PR, sends an SNS email if HIGH severity findings exist |
+
+**4. Check results:**
+
+- **PR comment** — the Notifier posts a findings summary directly on the pull request
+- **Email** — if any HIGH-severity vulnerabilities were found, an alert arrives at `NOTIFICATION_EMAIL`
+- **S3 report** — the full JSON report is at:
+
+```bash
+# List all scan jobs
+aws s3 ls s3://codeguard-reports-<ACCOUNT_ID>/jobs/ --region us-east-1
+
+# Download a specific report (replace JOB_ID with the ID from the PR comment)
+aws s3 cp s3://codeguard-reports-<ACCOUNT_ID>/jobs/<JOB_ID>/report.json /tmp/report.json --region us-east-1
+cat /tmp/report.json
+```
 
 ### Teardown
 
 ```bash
-./teardown.sh             # removes all resources, preserves S3 reports
-./teardown.sh --delete-s3 # also empties and deletes the S3 bucket
+bash infra/teardown.sh    # removes all resources, preserves S3 reports
+bash infra/teardown.sh --delete-s3	# also deletes S3 reports
 ```
 
 ---
@@ -157,7 +205,6 @@ If the Scanner fails, it publishes a `SCAN_FAILED` EventBridge event. The Webhoo
 ```
 CodeGuard/
 ├── deploy.sh                   # Master deployment script (run this)
-├── teardown.sh                 # Tear down all infrastructure
 ├── infra/
 │   ├── config.env              # ← Edit AWS_ACCOUNT_ID and NOTIFICATION_EMAIL here
 │   ├── state.env               # Auto-generated resource IDs (do not edit)
@@ -168,7 +215,8 @@ CodeGuard/
 │   ├── 05-cloudwatch.sh        # CloudWatch log groups and alarms
 │   ├── 06-s3-sns.sh            # Shared S3 bucket + SNS topic
 │   ├── 07-lambda-scanner.sh    # SAST Scanner Lambda (ECR image)
-│   └── 08-lambda-notifier.sh   # Notifier Lambda (zip) + S3 trigger
+│   ├── 08-lambda-notifier.sh   # Notifier Lambda (zip) + S3 trigger
+│   └── teardown.sh             # Tear down all infrastructure
 ├── lambda-webhook/             # Person A — webhook handler source
 │   ├── Dockerfile
 │   └── src/
@@ -216,7 +264,7 @@ The scanner detects the following vulnerability types in JavaScript/TypeScript:
 
 | Resource | Name | Purpose |
 |----------|------|---------|
-| EC2 (t3.micro) | `codeguard-ec2` | Nginx HTTPS proxy, rate limiting, HMAC forwarding |
+| EC2 (t3.micro) | `codeguard-ec2` | Nginx HTTP proxy + webhook proxy service, rate limiting, HMAC forwarding |
 | Lambda | `codeguard-webhook-handler` | Validates webhook, creates job, invokes scanner |
 | Lambda | `codeguard-sast-scanner` | Downloads repo, runs SAST, writes report |
 | Lambda | `codeguard-notifier` | Posts PR comment, sends SNS alert |
