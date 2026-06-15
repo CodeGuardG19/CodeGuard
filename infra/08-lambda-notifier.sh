@@ -24,7 +24,7 @@ fi
 
 # ── Install dependencies and package zip ─────────────────────────────────────
 log "Installing notifier Lambda dependencies..."
-(cd "${NOTIFIER_DIR}" && npm ci --omit=dev --silent)
+(cd "${NOTIFIER_DIR}" && npm install --omit=dev --silent)
 
 log "Creating deployment zip..."
 rm -f "${ZIP_PATH}"

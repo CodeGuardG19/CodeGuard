@@ -32,35 +32,145 @@ save EC2_AMI_ID "${EC2_AMI_ID}"
 USER_DATA=$(cat <<'USERDATA'
 #!/bin/bash
 set -euo pipefail
+exec >> /var/log/codeguard-init.log 2>&1
 
-# Update and install Nginx + Certbot
+echo "[$(date)] user-data starting"
+
+# ── Install packages ───────────────────────────────────────────────────────────
 dnf update -y
-dnf install -y nginx certbot python3-certbot-nginx amazon-cloudwatch-agent
+dnf install -y nginx amazon-cloudwatch-agent nodejs npm
 
-# Ensure Nginx starts on boot
 systemctl enable nginx
-
-# Create web root for Certbot challenge
 mkdir -p /var/www/certbot
 
-# Placeholder nginx config will be overwritten by SSM Run Command (05-cloudwatch.sh)
-# that runs after the Lambda Function URL is known.
-cat > /etc/nginx/conf.d/codeguard.conf <<'NGINXCONF'
+# ── Nginx: proxy /webhook to the local proxy process on :3001 ─────────────────
+# No placeholder needed — nginx is fully configured from the start.
+cat > /etc/nginx/conf.d/codeguard.conf <<'NGINXEOF'
+limit_req_zone $binary_remote_addr zone=webhook_limit:10m rate=20r/s;
+
 server {
     listen 80;
+    client_max_body_size 26m;
+    access_log /var/log/nginx/access.log combined;
+    error_log  /var/log/nginx/error.log warn;
+
+    location = /webhook {
+        limit_except POST { deny all; }
+        limit_req zone=webhook_limit burst=5 nodelay;
+        proxy_pass http://127.0.0.1:3001;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_pass_request_headers on;
+        proxy_read_timeout    10s;
+        proxy_connect_timeout  5s;
+        proxy_send_timeout     5s;
+    }
+
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
     }
-    location / {
-        return 503 "CodeGuard not yet configured";
-    }
+
+    location / { return 404; }
 }
-NGINXCONF
+NGINXEOF
 
 systemctl start nginx
 
-# Signal CloudFormation/user-data success
-echo "EC2 user-data complete" >> /var/log/codeguard-init.log
+# ── Webhook proxy: invokes Lambda directly using EC2 instance role (LabRole) ──
+# Lambda Function URLs require public IAM auth that Academy SCPs block.
+# Direct lambda:InvokeFunction from LabRole has no such restriction.
+mkdir -p /opt/codeguard-proxy
+cd /opt/codeguard-proxy
+npm init -y >> /var/log/codeguard-init.log 2>&1
+npm install @aws-sdk/client-lambda --omit=dev >> /var/log/codeguard-init.log 2>&1
+
+cat > /opt/codeguard-proxy/index.js <<'PROXYEOF'
+'use strict';
+const http = require('http');
+const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
+
+const REGION = 'us-east-1';
+const FUNCTION_NAME = 'codeguard-webhook-handler';
+const lambda = new LambdaClient({ region: REGION });
+
+const server = http.createServer((req, res) => {
+  if (req.method !== 'POST' || req.url !== '/webhook') {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end('{"error":"not found"}');
+    return;
+  }
+
+  const chunks = [];
+  req.on('data', c => chunks.push(c));
+  req.on('end', () => {
+    const body = Buffer.concat(chunks).toString('utf8');
+
+    // Build Function URL-compatible event so Lambda handler needs no changes
+    const event = {
+      version: '2.0',
+      routeKey: '$default',
+      rawPath: '/webhook',
+      rawQueryString: '',
+      headers: Object.fromEntries(Object.entries(req.headers)),
+      body,
+      isBase64Encoded: false,
+      requestContext: { http: { method: 'POST', path: '/webhook' } },
+    };
+
+    // GitHub only needs a 2xx — respond immediately, invoke Lambda async
+    res.writeHead(202, { 'Content-Type': 'application/json' });
+    res.end('{"status":"accepted"}');
+
+    lambda.send(new InvokeCommand({
+      FunctionName: FUNCTION_NAME,
+      InvocationType: 'Event',
+      Payload: Buffer.from(JSON.stringify(event)),
+    })).then(() => {
+      console.log('[proxy] Lambda invoked OK');
+    }).catch(err => {
+      console.error('[proxy] Lambda invoke failed:', err.message);
+    });
+  });
+
+  req.on('error', err => {
+    console.error('[proxy] request error:', err.message);
+    if (!res.headersSent) { res.writeHead(400); res.end(); }
+  });
+});
+
+server.listen(3001, '127.0.0.1', () => {
+  console.log('[proxy] CodeGuard webhook proxy listening on :3001');
+});
+PROXYEOF
+
+# ── Systemd service for proxy ──────────────────────────────────────────────────
+cat > /etc/systemd/system/codeguard-proxy.service <<'SERVICEEOF'
+[Unit]
+Description=CodeGuard Webhook Proxy
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/codeguard-proxy
+ExecStart=/usr/bin/node /opt/codeguard-proxy/index.js
+Restart=always
+RestartSec=5
+Environment=AWS_REGION=us-east-1
+Environment=LAMBDA_FUNCTION_NAME=codeguard-webhook-handler
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+
+systemctl daemon-reload
+systemctl enable codeguard-proxy
+systemctl start codeguard-proxy
+
+echo "[$(date)] user-data complete."
 USERDATA
 )
 
@@ -109,8 +219,8 @@ log "Elastic IP: ${EC2_PUBLIC_IP} (allocation: ${EC2_EIP_ALLOC_ID})"
 save EC2_EIP_ALLOC_ID "${EC2_EIP_ALLOC_ID}"
 save EC2_PUBLIC_IP "${EC2_PUBLIC_IP}"
 
-# ── Deploy nginx.conf via SSM Run Command ─────────────────────────────────────
-# Wait for SSM agent to be ready before sending commands
+# ── Wait for SSM agent to come online ─────────────────────────────────────────
+# nginx will be configured by 04-lambda.sh once the Lambda Function URL is known.
 log "Waiting for SSM agent on instance..."
 for i in $(seq 1 30); do
   STATUS=$(aws ssm describe-instance-information \
@@ -125,31 +235,12 @@ for i in $(seq 1 30); do
   sleep 10
 done
 
-NGINX_CONF=$(cat "${SCRIPT_DIR}/../ec2/nginx.conf")
-
-SSM_CMD_ID=$(aws ssm send-command \
-  --instance-ids "${INSTANCE_ID}" \
-  --document-name "AWS-RunShellScript" \
-  --parameters "commands=[
-    \"cat > /etc/nginx/conf.d/codeguard.conf << 'NGINXEOF'\n${NGINX_CONF}\nNGINXEOF\",
-    \"nginx -t && systemctl reload nginx\"
-  ]" \
-  --region "${AWS_REGION}" \
-  --query 'Command.CommandId' --output text)
-
-log "Waiting for SSM command ${SSM_CMD_ID} to complete..."
-aws ssm wait command-executed \
-  --command-id "${SSM_CMD_ID}" \
-  --instance-id "${INSTANCE_ID}" \
-  --region "${AWS_REGION}" 2>/dev/null || true
-
-log "Nginx configuration deployed."
 log ""
 log "╔═══════════════════════════════════════════════════════════════╗"
 log "║  EC2 Elastic IP: ${EC2_PUBLIC_IP}                            ║"
-log "║  Next step: after 04-lambda.sh runs and you have a domain,   ║"
-log "║  run certbot to issue a TLS cert:                             ║"
-log "║    sudo certbot --nginx -d your.domain.com                    ║"
+log "║  Nginx is serving HTTP on port 80.                           ║"
+log "║  Run 04-lambda.sh next — it will configure nginx with the    ║"
+log "║  Lambda Function URL automatically via SSM send-command.     ║"
 log "╚═══════════════════════════════════════════════════════════════╝"
 
 log "03-ec2.sh complete."

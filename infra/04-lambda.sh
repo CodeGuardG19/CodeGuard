@@ -133,32 +133,14 @@ aws lambda put-function-event-invoke-config \
 
 save WEBHOOK_LAMBDA_ARN "${WEBHOOK_LAMBDA_ARN}"
 
-# ── Lambda Function URL ────────────────────────────────────────────────────────
-# Auth type is NONE because EC2 Nginx is the auth boundary.
-# The Function URL has no public DNS route — only the EC2 proxy can reach it
-# via the VPC. AWS Function URLs on VPC-attached Lambdas are accessible only
-# from within the VPC when the Lambda's security group permits inbound traffic.
-log "Creating Lambda Function URL..."
-FUNCTION_URL=$(aws lambda create-function-url-config \
-  --function-name "${WEBHOOK_LAMBDA_NAME}" \
-  --auth-type NONE \
-  --region "${AWS_REGION}" \
-  --query 'FunctionUrl' --output text 2>/dev/null || \
-  aws lambda get-function-url-config \
-    --function-name "${WEBHOOK_LAMBDA_NAME}" \
-    --region "${AWS_REGION}" \
-    --query 'FunctionUrl' --output text)
-
-log "Function URL: ${FUNCTION_URL}"
-save FUNCTION_URL "${FUNCTION_URL}"
-
-# Allow public invocation via Function URL (Nginx is the access control layer)
+# Allow EC2 proxy (LabRole) to invoke this Lambda directly.
+# This replaces Lambda Function URLs which are blocked by Academy SCPs.
+log "Granting EC2 proxy (LabRole) permission to invoke webhook Lambda..."
 aws lambda add-permission \
   --function-name "${WEBHOOK_LAMBDA_NAME}" \
-  --statement-id AllowFunctionURLInvoke \
-  --action lambda:InvokeFunctionUrl \
-  --principal "*" \
-  --function-url-auth-type NONE \
+  --statement-id AllowEC2ProxyInvoke \
+  --action lambda:InvokeFunction \
+  --principal "arn:aws:iam::${AWS_ACCOUNT_ID}:role/LabRole" \
   --region "${AWS_REGION}" 2>/dev/null || true
 
 # ── EventBridge: warm-up ping every 5 minutes ─────────────────────────────────
@@ -219,26 +201,10 @@ aws lambda add-permission \
 log "Retry rule created: ${RETRY_RULE_ARN}"
 save RETRY_RULE_ARN "${RETRY_RULE_ARN}"
 
-# ── Update Nginx config with actual Function URL ──────────────────────────────
-log "Updating Nginx config with Lambda Function URL..."
-# Strip trailing slash from Function URL for proxy_pass
-FUNCTION_URL_CLEAN="${FUNCTION_URL%/}"
-
-aws ssm send-command \
-  --instance-ids "${EC2_INSTANCE_ID}" \
-  --document-name "AWS-RunShellScript" \
-  --parameters "commands=[
-    \"sed -i 's|LAMBDA_FUNCTION_URL_PLACEHOLDER|${FUNCTION_URL_CLEAN}|g' /etc/nginx/conf.d/codeguard.conf\",
-    \"nginx -t && systemctl reload nginx\"
-  ]" \
-  --region "${AWS_REGION}" \
-  --query 'Command.CommandId' --output text > /dev/null
-
 log ""
 log "╔═══════════════════════════════════════════════════════════════╗"
-log "║  Lambda Function URL: ${FUNCTION_URL}      ║"
-log "║  NOTE: This URL is only reachable from within the VPC.        ║"
-log "║  Public webhook endpoint: https://${EC2_PUBLIC_IP}/webhook    ║"
+log "║  Public webhook endpoint: http://${EC2_PUBLIC_IP}/webhook     ║"
+log "║  Configure GitHub webhook to POST to this HTTP URL.           ║"
 log "╚═══════════════════════════════════════════════════════════════╝"
 
 log "04-lambda.sh complete."

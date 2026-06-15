@@ -80,18 +80,18 @@ run_step "Lambda — Notifier + S3 trigger (Person C)" "${INFRA}/08-lambda-notif
 run_step "CloudWatch log groups and alarms" "${INFRA}/05-cloudwatch.sh"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
-source "${INFRA}/${STATE_FILE}"
+source "${STATE_FILE}"
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════════════╗"
 echo "║                    Deployment Complete!                         ║"
 echo "╠══════════════════════════════════════════════════════════════════╣"
 echo "║  Public webhook URL:                                            ║"
-echo "║    https://${EC2_PUBLIC_IP}/webhook                             ║"
+echo "║    http://${EC2_PUBLIC_IP}/webhook                              ║"
 echo "║                                                                  ║"
 echo "║  Configure GitHub:                                              ║"
 echo "║    Repo → Settings → Webhooks → Add webhook                     ║"
-echo "║    Payload URL : https://${EC2_PUBLIC_IP}/webhook               ║"
+echo "║    Payload URL : http://${EC2_PUBLIC_IP}/webhook                ║"
 echo "║    Content type: application/json                               ║"
 echo "║    Secret      : (value from SSM ${WEBHOOK_SECRET_PARAM})      ║"
 echo "║    Events      : Pull requests + Pushes                         ║"
