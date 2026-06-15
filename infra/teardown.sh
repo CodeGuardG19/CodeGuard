@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # teardown.sh — Deletes all CodeGuard resources in safe reverse order.
-# Prints each step before executing. On failure, prints the failed resource
-# and continues rather than stopping.
+# Prints each step before executing. On failure, prints the resource and continues.
+#
+# Key ordering rules:
+#   1. Lambdas must be deleted before their ENIs can be released from the subnets
+#   2. NAT Gateway must be deleted and reach 'deleted' state before releasing its EIP
+#   3. VPC endpoints must finish deleting before the VPC can be removed
+#   4. All ENIs must be gone before security groups and subnets can be deleted
+#   5. IGW must be detached before VPC deletion
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,178 +23,197 @@ ERRORS=0
 step() { echo ""; echo "▶ $*"; }
 ok()   { echo "  ✓ $*"; }
 fail() { echo "  ✗ FAILED: $*"; ERRORS=$((ERRORS + 1)); }
-
-run() {
+try()  {
   local desc="$1"; shift
-  step "${desc}"
-  if "$@" 2>&1; then
-    ok "${desc}"
-  else
-    fail "${desc}"
-  fi
+  "$@" 2>/dev/null && ok "${desc}" || fail "${desc}"
 }
 
-# ── Lambda resources ───────────────────────────────────────────────────────────
+# ── EventBridge rules (must go before Lambdas) ────────────────────────────────
 step "Removing EventBridge targets and rules..."
-aws events remove-targets \
-  --rule codeguard-lambda-warmup \
-  --ids WebhookHandlerWarmup \
-  --region "${AWS_REGION}" 2>/dev/null && ok "Warmup rule targets removed" || fail "Warmup rule targets"
-aws events delete-rule \
-  --name codeguard-lambda-warmup \
-  --region "${AWS_REGION}" 2>/dev/null && ok "Warmup rule deleted" || fail "Warmup rule"
+try "Webhook warmup targets"    aws events remove-targets --rule codeguard-lambda-warmup       --ids WebhookHandlerWarmup    --region "${AWS_REGION}"
+try "Webhook warmup rule"       aws events delete-rule    --name codeguard-lambda-warmup                                      --region "${AWS_REGION}"
+try "Retry rule targets"        aws events remove-targets --rule codeguard-scan-failed-retry   --ids WebhookHandlerRetry     --region "${AWS_REGION}"
+try "Retry rule"                aws events delete-rule    --name codeguard-scan-failed-retry                                  --region "${AWS_REGION}"
+try "Scanner warmup targets"    aws events remove-targets --rule codeguard-scanner-warmup      --ids SastScannerWarmup       --region "${AWS_REGION}"
+try "Scanner warmup rule"       aws events delete-rule    --name codeguard-scanner-warmup                                    --region "${AWS_REGION}"
 
-aws events remove-targets \
-  --rule codeguard-scan-failed-retry \
-  --ids WebhookHandlerRetry \
-  --region "${AWS_REGION}" 2>/dev/null && ok "Retry rule targets removed" || fail "Retry rule targets"
-aws events delete-rule \
-  --name codeguard-scan-failed-retry \
-  --region "${AWS_REGION}" 2>/dev/null && ok "Retry rule deleted" || fail "Retry rule"
+# ── Lambda Function URLs ───────────────────────────────────────────────────────
+step "Deleting Lambda Function URLs..."
+try "Webhook Function URL" aws lambda delete-function-url-config \
+  --function-name "${WEBHOOK_LAMBDA_NAME:-codeguard-webhook-handler}" --region "${AWS_REGION}"
 
-step "Deleting Lambda Function URL..."
-aws lambda delete-function-url-config \
-  --function-name "${WEBHOOK_LAMBDA_NAME:-codeguard-webhook-handler}" \
-  --region "${AWS_REGION}" 2>/dev/null && ok "Function URL deleted" || fail "Function URL"
+# ── Lambda functions ───────────────────────────────────────────────────────────
+step "Deleting Lambda functions..."
+try "Webhook Lambda" aws lambda delete-function \
+  --function-name "${WEBHOOK_LAMBDA_NAME:-codeguard-webhook-handler}" --region "${AWS_REGION}"
+try "Scanner Lambda" aws lambda delete-function \
+  --function-name "${SAST_LAMBDA_NAME:-codeguard-sast-scanner}" --region "${AWS_REGION}"
+try "Notifier Lambda" aws lambda delete-function \
+  --function-name "${NOTIFIER_LAMBDA_NAME:-codeguard-notifier}" --region "${AWS_REGION}"
 
-step "Deleting Lambda function..."
-aws lambda delete-function \
-  --function-name "${WEBHOOK_LAMBDA_NAME:-codeguard-webhook-handler}" \
-  --region "${AWS_REGION}" 2>/dev/null && ok "Lambda deleted" || fail "Lambda"
+# ── Wait for Lambda ENIs to be released ───────────────────────────────────────
+# AWS takes up to 5 minutes to delete the ENIs Lambda created for VPC access.
+# Without this wait, security group and subnet deletion will fail with DependencyViolation.
+step "Waiting for Lambda VPC ENIs to be released (up to 5 min)..."
+if [ -n "${VPC_ID:-}" ]; then
+  for i in $(seq 1 30); do
+    ENI_COUNT=$(aws ec2 describe-network-interfaces \
+      --filters "Name=vpc-id,Values=${VPC_ID}" \
+                "Name=interface-type,Values=lambda" \
+      --query 'length(NetworkInterfaces)' \
+      --output text --region "${AWS_REGION}" 2>/dev/null || echo "0")
+    if [ "${ENI_COUNT}" = "0" ]; then
+      ok "All Lambda ENIs released."
+      break
+    fi
+    echo "  ${ENI_COUNT} Lambda ENI(s) still present (attempt ${i}/30), waiting 10s..."
+    sleep 10
+  done
+fi
 
-# ── CloudWatch alarms and log groups ──────────────────────────────────────────
+# ── CloudWatch alarms ─────────────────────────────────────────────────────────
 step "Deleting CloudWatch alarms..."
-aws cloudwatch delete-alarms \
+try "CloudWatch alarms" aws cloudwatch delete-alarms \
   --alarm-names \
     codeguard-lambda-error-rate \
     codeguard-lambda-p95-duration \
     codeguard-ec2-cpu-high \
-  --region "${AWS_REGION}" 2>/dev/null && ok "Alarms deleted" || fail "Alarms"
+    codeguard-scanner-error-rate \
+    codeguard-notifier-error-rate \
+  --region "${AWS_REGION}"
 
+# ── CloudWatch log groups ─────────────────────────────────────────────────────
 step "Deleting CloudWatch log groups..."
 for LG in \
   "/codeguard/lambda/webhook-handler" \
+  "/codeguard/lambda/sast-scanner" \
+  "/codeguard/lambda/notifier" \
   "/codeguard/ec2/nginx-access" \
   "/codeguard/ec2/nginx-error"; do
-  aws logs delete-log-group \
-    --log-group-name "${LG}" \
-    --region "${AWS_REGION}" 2>/dev/null && ok "Log group ${LG} deleted" || fail "Log group ${LG}"
+  try "Log group ${LG}" aws logs delete-log-group \
+    --log-group-name "${LG}" --region "${AWS_REGION}"
 done
 
-# ── ECR repository ─────────────────────────────────────────────────────────────
-step "Deleting ECR repository (force — removes all images)..."
-aws ecr delete-repository \
-  --repository-name "${ECR_REPO_NAME:-codeguard-webhook-handler}" \
-  --force \
-  --region "${AWS_REGION}" 2>/dev/null && ok "ECR repository deleted" || fail "ECR repository"
+# ── ECR repositories ──────────────────────────────────────────────────────────
+step "Deleting ECR repositories..."
+try "Webhook ECR repo" aws ecr delete-repository \
+  --repository-name "${WEBHOOK_ECR_REPO:-codeguard-webhook-handler}" \
+  --force --region "${AWS_REGION}"
+try "Scanner ECR repo" aws ecr delete-repository \
+  --repository-name "${SCANNER_ECR_REPO:-codeguard-sast-scanner}" \
+  --force --region "${AWS_REGION}"
 
-# ── EC2 instance and Elastic IP ───────────────────────────────────────────────
+# ── SSM parameters ────────────────────────────────────────────────────────────
+step "Deleting SSM parameters..."
+try "Webhook secret param"  aws ssm delete-parameter --name "${WEBHOOK_SECRET_PARAM:-/codeguard/github-webhook-secret}" --region "${AWS_REGION}"
+try "CW agent config param" aws ssm delete-parameter --name "/codeguard/cw-agent-config"                                --region "${AWS_REGION}"
+try "GitHub token param"    aws ssm delete-parameter --name "${GITHUB_TOKEN_PARAM:-/codeguard/github-token}"            --region "${AWS_REGION}"
+
+# ── EC2 instance ──────────────────────────────────────────────────────────────
 if [ -n "${EC2_INSTANCE_ID:-}" ]; then
   step "Terminating EC2 instance ${EC2_INSTANCE_ID}..."
-  aws ec2 terminate-instances \
-    --instance-ids "${EC2_INSTANCE_ID}" \
-    --region "${AWS_REGION}" 2>/dev/null && ok "EC2 termination initiated" || fail "EC2 termination"
-
-  echo "  Waiting for EC2 to terminate..."
+  try "EC2 terminate" aws ec2 terminate-instances \
+    --instance-ids "${EC2_INSTANCE_ID}" --region "${AWS_REGION}"
+  echo "  Waiting for EC2 to reach terminated state..."
   aws ec2 wait instance-terminated \
-    --instance-ids "${EC2_INSTANCE_ID}" \
-    --region "${AWS_REGION}" 2>/dev/null || fail "EC2 wait terminated"
+    --instance-ids "${EC2_INSTANCE_ID}" --region "${AWS_REGION}" 2>/dev/null \
+    && ok "EC2 terminated" || fail "EC2 wait terminated"
 fi
 
 if [ -n "${EC2_EIP_ALLOC_ID:-}" ]; then
-  step "Releasing EC2 Elastic IP ${EC2_EIP_ALLOC_ID}..."
-  aws ec2 release-address \
-    --allocation-id "${EC2_EIP_ALLOC_ID}" \
-    --region "${AWS_REGION}" 2>/dev/null && ok "EC2 EIP released" || fail "EC2 EIP"
+  step "Releasing EC2 Elastic IP..."
+  try "EC2 EIP release" aws ec2 release-address \
+    --allocation-id "${EC2_EIP_ALLOC_ID}" --region "${AWS_REGION}"
 fi
 
 # ── IAM ───────────────────────────────────────────────────────────────────────
-# LabRole and LabInstanceProfile are pre-provisioned by the course environment
-# and are NOT deleted — we did not create them and do not own them.
-step "Skipping IAM role deletion (LabRole is course-managed, not created by us)"
+# LabRole and LabInstanceProfile are course-managed — not deleted.
+step "Skipping IAM role deletion (LabRole is course-managed)"
 ok "IAM roles skipped"
 
-# ── NAT Gateway and NAT EIP ───────────────────────────────────────────────────
+# ── NAT Gateway ───────────────────────────────────────────────────────────────
 if [ -n "${NAT_GW_ID:-}" ]; then
   step "Deleting NAT Gateway ${NAT_GW_ID}..."
-  aws ec2 delete-nat-gateway \
-    --nat-gateway-id "${NAT_GW_ID}" \
-    --region "${AWS_REGION}" 2>/dev/null && ok "NAT Gateway delete initiated" || fail "NAT Gateway"
-
-  echo "  Waiting for NAT Gateway to be deleted (may take ~1 minute)..."
+  try "NAT Gateway delete" aws ec2 delete-nat-gateway \
+    --nat-gateway-id "${NAT_GW_ID}" --region "${AWS_REGION}"
+  echo "  Waiting for NAT Gateway to reach deleted state (up to 2 min)..."
   aws ec2 wait nat-gateway-deleted \
-    --nat-gateway-ids "${NAT_GW_ID}" \
-    --region "${AWS_REGION}" 2>/dev/null || fail "NAT Gateway wait deleted"
+    --nat-gateway-ids "${NAT_GW_ID}" --region "${AWS_REGION}" 2>/dev/null \
+    && ok "NAT Gateway deleted" || fail "NAT Gateway wait"
 fi
 
 if [ -n "${NAT_EIP_ALLOC_ID:-}" ]; then
-  step "Releasing NAT Elastic IP ${NAT_EIP_ALLOC_ID}..."
-  aws ec2 release-address \
-    --allocation-id "${NAT_EIP_ALLOC_ID}" \
-    --region "${AWS_REGION}" 2>/dev/null && ok "NAT EIP released" || fail "NAT EIP"
+  step "Releasing NAT Elastic IP..."
+  try "NAT EIP release" aws ec2 release-address \
+    --allocation-id "${NAT_EIP_ALLOC_ID}" --region "${AWS_REGION}"
 fi
 
 # ── VPC Endpoints ─────────────────────────────────────────────────────────────
-for EP_ID in "${SNS_ENDPOINT_ID:-}" "${S3_ENDPOINT_ID:-}"; do
-  if [ -n "${EP_ID}" ]; then
-    step "Deleting VPC endpoint ${EP_ID}..."
-    aws ec2 delete-vpc-endpoints \
-      --vpc-endpoint-ids "${EP_ID}" \
-      --region "${AWS_REGION}" 2>/dev/null && ok "Endpoint ${EP_ID} deleted" || fail "Endpoint ${EP_ID}"
-  fi
-done
+step "Deleting VPC endpoints..."
+EP_IDS=()
+[ -n "${SNS_ENDPOINT_ID:-}" ] && EP_IDS+=("${SNS_ENDPOINT_ID}")
+[ -n "${S3_ENDPOINT_ID:-}"  ] && EP_IDS+=("${S3_ENDPOINT_ID}")
+
+if [ "${#EP_IDS[@]}" -gt 0 ]; then
+  try "VPC endpoints delete" aws ec2 delete-vpc-endpoints \
+    --vpc-endpoint-ids "${EP_IDS[@]}" --region "${AWS_REGION}"
+
+  echo "  Waiting for VPC endpoints to finish deleting..."
+  for i in $(seq 1 18); do
+    PENDING=$(aws ec2 describe-vpc-endpoints \
+      --vpc-endpoint-ids "${EP_IDS[@]}" \
+      --query 'VpcEndpoints[?State!=`deleted`].VpcEndpointId' \
+      --output text --region "${AWS_REGION}" 2>/dev/null || echo "")
+    if [ -z "${PENDING}" ]; then
+      ok "VPC endpoints deleted."
+      break
+    fi
+    echo "  Still deleting: ${PENDING} (attempt ${i}/18), waiting 10s..."
+    sleep 10
+  done
+fi
 
 # ── Security Groups ────────────────────────────────────────────────────────────
+step "Deleting security groups..."
 for SG_ID in "${LAMBDA_SG_ID:-}" "${EC2_SG_ID:-}" "${SNS_ENDPOINT_SG_ID:-}"; do
-  if [ -n "${SG_ID}" ]; then
-    step "Deleting security group ${SG_ID}..."
-    aws ec2 delete-security-group \
-      --group-id "${SG_ID}" \
-      --region "${AWS_REGION}" 2>/dev/null && ok "SG ${SG_ID} deleted" || fail "SG ${SG_ID}"
-  fi
+  [ -z "${SG_ID}" ] && continue
+  try "Security group ${SG_ID}" aws ec2 delete-security-group \
+    --group-id "${SG_ID}" --region "${AWS_REGION}"
 done
 
 # ── Subnets ───────────────────────────────────────────────────────────────────
+step "Deleting subnets..."
 for SUBNET_ID in "${PRIVATE_SUBNET_ID:-}" "${PUBLIC_SUBNET_ID:-}"; do
-  if [ -n "${SUBNET_ID}" ]; then
-    step "Deleting subnet ${SUBNET_ID}..."
-    aws ec2 delete-subnet \
-      --subnet-id "${SUBNET_ID}" \
-      --region "${AWS_REGION}" 2>/dev/null && ok "Subnet ${SUBNET_ID} deleted" || fail "Subnet ${SUBNET_ID}"
-  fi
+  [ -z "${SUBNET_ID}" ] && continue
+  try "Subnet ${SUBNET_ID}" aws ec2 delete-subnet \
+    --subnet-id "${SUBNET_ID}" --region "${AWS_REGION}"
 done
 
 # ── Route Tables ──────────────────────────────────────────────────────────────
+step "Deleting route tables..."
 for RT_ID in "${PRIVATE_RT_ID:-}" "${PUBLIC_RT_ID:-}"; do
-  if [ -n "${RT_ID}" ]; then
-    step "Deleting route table ${RT_ID}..."
-    aws ec2 delete-route-table \
-      --route-table-id "${RT_ID}" \
-      --region "${AWS_REGION}" 2>/dev/null && ok "Route table ${RT_ID} deleted" || fail "Route table ${RT_ID}"
-  fi
+  [ -z "${RT_ID}" ] && continue
+  try "Route table ${RT_ID}" aws ec2 delete-route-table \
+    --route-table-id "${RT_ID}" --region "${AWS_REGION}"
 done
 
 # ── Internet Gateway ──────────────────────────────────────────────────────────
 if [ -n "${IGW_ID:-}" ] && [ -n "${VPC_ID:-}" ]; then
   step "Detaching and deleting Internet Gateway ${IGW_ID}..."
-  aws ec2 detach-internet-gateway \
-    --internet-gateway-id "${IGW_ID}" \
-    --vpc-id "${VPC_ID}" \
-    --region "${AWS_REGION}" 2>/dev/null && ok "IGW detached" || fail "IGW detach"
-  aws ec2 delete-internet-gateway \
-    --internet-gateway-id "${IGW_ID}" \
-    --region "${AWS_REGION}" 2>/dev/null && ok "IGW deleted" || fail "IGW delete"
+  try "IGW detach" aws ec2 detach-internet-gateway \
+    --internet-gateway-id "${IGW_ID}" --vpc-id "${VPC_ID}" --region "${AWS_REGION}"
+  try "IGW delete" aws ec2 delete-internet-gateway \
+    --internet-gateway-id "${IGW_ID}" --region "${AWS_REGION}"
 fi
 
 # ── VPC ───────────────────────────────────────────────────────────────────────
 if [ -n "${VPC_ID:-}" ]; then
   step "Deleting VPC ${VPC_ID}..."
-  aws ec2 delete-vpc \
-    --vpc-id "${VPC_ID}" \
-    --region "${AWS_REGION}" 2>/dev/null && ok "VPC deleted" || fail "VPC"
+  try "VPC delete" aws ec2 delete-vpc \
+    --vpc-id "${VPC_ID}" --region "${AWS_REGION}"
 fi
 
-# ── Cleanup state file ────────────────────────────────────────────────────────
+# ── State file ────────────────────────────────────────────────────────────────
 step "Removing state file..."
 rm -f "${STATE_FILE}" && ok "state.env removed" || fail "state.env removal"
 

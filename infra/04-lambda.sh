@@ -49,7 +49,7 @@ log "Pushing image to ECR..."
 docker push "${ECR_REPO_URI}:latest"
 
 IMAGE_DIGEST=$(aws ecr describe-images \
-  --repository-name "${ECR_REPO_NAME}" \
+  --repository-name "${WEBHOOK_ECR_REPO}" \
   --image-ids imageTag=latest \
   --region "${AWS_REGION}" \
   --query 'imageDetails[0].imageDigest' --output text)
