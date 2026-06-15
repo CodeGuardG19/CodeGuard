@@ -20,6 +20,7 @@ CodeGuard is a cloud-native SAST (Static Application Security Testing) pipeline 
 ```bash
 git clone https://github.com/CodeGuardG19/CodeGuard.git
 cd CodeGuard
+git branch <YOUR_NEW_BRANCH>
 git checkout <YOUR_NEW_BRANCH>
 ```
 
