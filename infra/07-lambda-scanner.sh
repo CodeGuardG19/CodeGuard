@@ -17,20 +17,6 @@ SCANNER_ECR_URI="${ECR_REGISTRY}/${SCANNER_ECR_REPO}"
 SCANNER_DIR="${SCRIPT_DIR}/../lambda-scanner"
 SCANNER_LAMBDA_ARN="arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${SAST_LAMBDA_NAME}"
 
-# ── Verify GitHub token SSM param exists ─────────────────────────────────────
-log "Verifying SSM parameter ${GITHUB_TOKEN_PARAM} exists..."
-if ! aws ssm get-parameter \
-     --name "${GITHUB_TOKEN_PARAM}" \
-     --region "${AWS_REGION}" &>/dev/null; then
-  echo ""
-  echo "ERROR: SSM parameter ${GITHUB_TOKEN_PARAM} not found."
-  echo "Create it before running this script:"
-  echo "  aws ssm put-parameter --name '${GITHUB_TOKEN_PARAM}' \\"
-  echo "    --value '<YOUR_GITHUB_PERSONAL_ACCESS_TOKEN>' \\"
-  echo "    --type SecureString --region ${AWS_REGION}"
-  exit 1
-fi
-
 # ── ECR: create repository if it does not exist ───────────────────────────────
 log "Ensuring ECR repository exists: ${SCANNER_ECR_REPO}..."
 if ! aws ecr describe-repositories \
