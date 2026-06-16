@@ -65,6 +65,13 @@ async function handleWebhook(event) {
     return { statusCode: 401, body: 'Unauthorized' };
   }
 
+  // GitHub ping events have no repo/commit data — acknowledge and exit early.
+  const githubEvent = event.headers?.['x-github-event'] || event.headers?.['X-GitHub-Event'];
+  if (githubEvent === 'ping') {
+    console.log(JSON.stringify({ message: 'GitHub ping received', ok: true }));
+    return { statusCode: 200, body: JSON.stringify({ message: 'pong' }) };
+  }
+
   let payload;
   try {
     payload = JSON.parse(rawBody);
