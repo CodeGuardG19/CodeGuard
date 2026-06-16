@@ -54,9 +54,9 @@ try "Notifier Lambda" aws lambda delete-function \
 # ── Wait for Lambda ENIs to be released ───────────────────────────────────────
 # AWS takes up to 5 minutes to delete the ENIs Lambda created for VPC access.
 # Without this wait, security group and subnet deletion will fail with DependencyViolation.
-step "Waiting for Lambda VPC ENIs to be released (up to 5 min)..."
+step "Waiting for Lambda VPC ENIs to be released (up to 5 tries)..."
 if [ -n "${VPC_ID:-}" ]; then
-  for i in $(seq 1 30); do
+  for i in $(seq 1 5); do
     ENI_COUNT=$(aws ec2 describe-network-interfaces \
       --filters "Name=vpc-id,Values=${VPC_ID}" \
                 "Name=interface-type,Values=lambda" \
@@ -66,7 +66,7 @@ if [ -n "${VPC_ID:-}" ]; then
       ok "All Lambda ENIs released."
       break
     fi
-    echo "  ${ENI_COUNT} Lambda ENI(s) still present (attempt ${i}/30), waiting 10s..."
+    echo "  ${ENI_COUNT} Lambda ENI(s) still present (attempt ${i}/5), waiting 10s..."
     sleep 10
   done
 fi
