@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 07-lambda-scanner.sh — Builds and pushes the SAST Scanner Docker image to ECR,
+# 05-lambda-scanner.sh — Builds and pushes the SAST Scanner Docker image to ECR,
 #                        then creates/updates the scanner Lambda function.
 set -euo pipefail
 
@@ -9,7 +9,7 @@ source "${SCRIPT_DIR}/state.env"
 
 STATE_FILE="${SCRIPT_DIR}/state.env"
 
-log()  { echo "[07-lambda-scanner] $*"; }
+log()  { echo "[05-lambda-scanner] $*"; }
 save() { echo "export $1=\"$2\"" >> "${STATE_FILE}"; }
 
 ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
@@ -141,4 +141,4 @@ aws lambda add-permission \
 
 log "Scanner warm-up rule: ${SCANNER_WARMUP_RULE_ARN}"
 
-log "07-lambda-scanner.sh complete."
+log "05-lambda-scanner.sh complete."
