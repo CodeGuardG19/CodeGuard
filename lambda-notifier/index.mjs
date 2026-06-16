@@ -53,7 +53,7 @@ function getJobIdFromS3Key(key) {
 }
 
 export const handler = async (event) => {
-  const bucket = process.env.BUCKET_NAME;
+  const bucket = process.env.S3_BUCKET_NAME;
 
   if (!event.Records?.length) throw new Error("Missing S3 Records in event");
 

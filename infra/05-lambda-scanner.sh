@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 07-lambda-scanner.sh — Builds and pushes the SAST Scanner Docker image to ECR,
+# 05-lambda-scanner.sh — Builds and pushes the SAST Scanner Docker image to ECR,
 #                        then creates/updates the scanner Lambda function.
 set -euo pipefail
 
@@ -9,27 +9,13 @@ source "${SCRIPT_DIR}/state.env"
 
 STATE_FILE="${SCRIPT_DIR}/state.env"
 
-log()  { echo "[07-lambda-scanner] $*"; }
+log()  { echo "[05-lambda-scanner] $*"; }
 save() { echo "export $1=\"$2\"" >> "${STATE_FILE}"; }
 
 ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 SCANNER_ECR_URI="${ECR_REGISTRY}/${SCANNER_ECR_REPO}"
 SCANNER_DIR="${SCRIPT_DIR}/../lambda-scanner"
 SCANNER_LAMBDA_ARN="arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${SAST_LAMBDA_NAME}"
-
-# ── Verify GitHub token SSM param exists ─────────────────────────────────────
-log "Verifying SSM parameter ${GITHUB_TOKEN_PARAM} exists..."
-if ! aws ssm get-parameter \
-     --name "${GITHUB_TOKEN_PARAM}" \
-     --region "${AWS_REGION}" &>/dev/null; then
-  echo ""
-  echo "ERROR: SSM parameter ${GITHUB_TOKEN_PARAM} not found."
-  echo "Create it before running this script:"
-  echo "  aws ssm put-parameter --name '${GITHUB_TOKEN_PARAM}' \\"
-  echo "    --value '<YOUR_GITHUB_PERSONAL_ACCESS_TOKEN>' \\"
-  echo "    --type SecureString --region ${AWS_REGION}"
-  exit 1
-fi
 
 # ── ECR: create repository if it does not exist ───────────────────────────────
 log "Ensuring ECR repository exists: ${SCANNER_ECR_REPO}..."
@@ -155,4 +141,4 @@ aws lambda add-permission \
 
 log "Scanner warm-up rule: ${SCANNER_WARMUP_RULE_ARN}"
 
-log "07-lambda-scanner.sh complete."
+log "05-lambda-scanner.sh complete."
