@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# 04-lambda.sh — Builds and pushes Docker image to ECR, creates/updates Lambda,
-#                configures Function URL, and sets up EventBridge rules for
-#                warm-up pings and SCAN_FAILED retry events.
+# 04-lambda.sh — Builds and pushes Docker image to ECR, creates/updates the
+#                webhook handler Lambda, exposes it via a public Lambda Function
+#                URL (the GitHub webhook target), and sets up EventBridge rules
+#                for warm-up pings and SCAN_FAILED retry events.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -133,15 +134,107 @@ aws lambda put-function-event-invoke-config \
 
 save WEBHOOK_LAMBDA_ARN "${WEBHOOK_LAMBDA_ARN}"
 
-# Allow EC2 proxy (LabRole) to invoke this Lambda directly.
-# This replaces Lambda Function URLs which are blocked by Academy SCPs.
-log "Granting EC2 proxy (LabRole) permission to invoke webhook Lambda..."
+# ── API Gateway (HTTP API): the GitHub webhook endpoint ───────────────────────
+# GitHub posts the webhook here; API Gateway proxies it to the Lambda. We use an
+# HTTP API with payload format 2.0 — the same event shape a Function URL emits,
+# so the handler (event.headers / event.body) needs no changes. The endpoint is
+# publicly reachable without SigV4 (GitHub can't sign requests); the handler
+# itself authenticates every request via HMAC-SHA256 (verify.js).
+#
+# Why not a Lambda Function URL? The Academy Lab SCP forbids invoking a Function
+# URL anonymously (AuthType=NONE) — anonymous requests are rejected with 403 at
+# the AWS platform layer before reaching the code. API Gateway invokes the
+# Lambda via the apigateway.amazonaws.com principal, not lambda:InvokeFunctionUrl,
+# so it is not blocked by that SCP.
+WEBHOOK_API_NAME="codeguard-webhook-api"
+WEBHOOK_ROUTE_KEY="POST /webhook"
+
+log "Creating/ensuring HTTP API Gateway for webhook handler..."
+API_ID=$(aws apigatewayv2 get-apis \
+  --region "${AWS_REGION}" \
+  --query "Items[?Name=='${WEBHOOK_API_NAME}'].ApiId | [0]" \
+  --output text 2>/dev/null || echo "None")
+
+if [ "${API_ID}" = "None" ] || [ -z "${API_ID}" ]; then
+  API_ID=$(aws apigatewayv2 create-api \
+    --name "${WEBHOOK_API_NAME}" \
+    --protocol-type HTTP \
+    --description "CodeGuard GitHub webhook ingress (replaces Lambda Function URL)" \
+    --tags "Project=${PROJECT_TAG}" \
+    --region "${AWS_REGION}" \
+    --query 'ApiId' --output text)
+  log "Created HTTP API: ${API_ID}"
+else
+  log "HTTP API already exists: ${API_ID}"
+fi
+save WEBHOOK_API_ID "${API_ID}"
+
+# Integration: AWS_PROXY → webhook Lambda (payload format 2.0)
+INTEGRATION_ID=$(aws apigatewayv2 get-integrations \
+  --api-id "${API_ID}" \
+  --region "${AWS_REGION}" \
+  --query "Items[?IntegrationUri=='${WEBHOOK_LAMBDA_ARN}'].IntegrationId | [0]" \
+  --output text 2>/dev/null || echo "None")
+
+if [ "${INTEGRATION_ID}" = "None" ] || [ -z "${INTEGRATION_ID}" ]; then
+  INTEGRATION_ID=$(aws apigatewayv2 create-integration \
+    --api-id "${API_ID}" \
+    --integration-type AWS_PROXY \
+    --integration-uri "${WEBHOOK_LAMBDA_ARN}" \
+    --integration-method POST \
+    --payload-format-version 2.0 \
+    --region "${AWS_REGION}" \
+    --query 'IntegrationId' --output text)
+  log "Created integration: ${INTEGRATION_ID}"
+else
+  log "Integration already exists: ${INTEGRATION_ID}"
+fi
+
+# Route: POST /webhook → integration
+ROUTE_ID=$(aws apigatewayv2 get-routes \
+  --api-id "${API_ID}" \
+  --region "${AWS_REGION}" \
+  --query "Items[?RouteKey=='${WEBHOOK_ROUTE_KEY}'].RouteId | [0]" \
+  --output text 2>/dev/null || echo "None")
+
+if [ "${ROUTE_ID}" = "None" ] || [ -z "${ROUTE_ID}" ]; then
+  aws apigatewayv2 create-route \
+    --api-id "${API_ID}" \
+    --route-key "${WEBHOOK_ROUTE_KEY}" \
+    --target "integrations/${INTEGRATION_ID}" \
+    --region "${AWS_REGION}" >/dev/null
+  log "Created route: ${WEBHOOK_ROUTE_KEY}"
+else
+  log "Route already exists: ${WEBHOOK_ROUTE_KEY}"
+fi
+
+# Stage: $default with auto-deploy (no stage prefix in the URL)
+if ! aws apigatewayv2 get-stage \
+     --api-id "${API_ID}" \
+     --stage-name '$default' \
+     --region "${AWS_REGION}" &>/dev/null; then
+  aws apigatewayv2 create-stage \
+    --api-id "${API_ID}" \
+    --stage-name '$default' \
+    --auto-deploy \
+    --region "${AWS_REGION}" >/dev/null
+  log "Created \$default stage (auto-deploy)"
+else
+  log "\$default stage already exists"
+fi
+
+# Resource policy: allow API Gateway to invoke the Lambda. Idempotent.
 aws lambda add-permission \
   --function-name "${WEBHOOK_LAMBDA_NAME}" \
-  --statement-id AllowEC2ProxyInvoke \
+  --statement-id ApiGatewayInvokeWebhook \
   --action lambda:InvokeFunction \
-  --principal "arn:aws:iam::${AWS_ACCOUNT_ID}:role/LabRole" \
+  --principal apigateway.amazonaws.com \
+  --source-arn "arn:aws:execute-api:${AWS_REGION}:${AWS_ACCOUNT_ID}:${API_ID}/*/*/webhook" \
   --region "${AWS_REGION}" 2>/dev/null || true
+
+WEBHOOK_URL="https://${API_ID}.execute-api.${AWS_REGION}.amazonaws.com/webhook"
+log "Webhook endpoint (API Gateway): ${WEBHOOK_URL}"
+save WEBHOOK_URL "${WEBHOOK_URL}"
 
 # ── EventBridge: warm-up ping every 5 minutes ─────────────────────────────────
 log "Creating EventBridge warm-up rule (rate 5 minutes)..."
@@ -203,8 +296,9 @@ save RETRY_RULE_ARN "${RETRY_RULE_ARN}"
 
 log ""
 log "╔═══════════════════════════════════════════════════════════════╗"
-log "║  Public webhook endpoint: http://${EC2_PUBLIC_IP}/webhook     ║"
-log "║  Configure GitHub webhook to POST to this HTTP URL.           ║"
+log "║  Public webhook endpoint (API Gateway HTTP API):             ║"
+log "║    ${WEBHOOK_URL}"
+log "║  Configure the GitHub webhook to POST to this HTTPS URL.      ║"
 log "╚═══════════════════════════════════════════════════════════════╝"
 
 log "04-lambda.sh complete."

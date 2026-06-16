@@ -69,3 +69,7 @@ coverage/
 *.key
 *.crt
 *.cer
+
+# Local-only design notes (not committed)
+arc.md
+ARCHITECTURE.md

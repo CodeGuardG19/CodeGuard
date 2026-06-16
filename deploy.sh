@@ -64,19 +64,16 @@ run_step "Security groups (EC2, Lambda)" "${INFRA}/02-security.sh"
 # ── Step 3: S3 bucket + SNS topic ────────────────────────────────────────────
 run_step "S3 reports bucket + SNS alerts topic" "${INFRA}/06-s3-sns.sh"
 
-# ── Step 4: EC2 Nginx proxy ───────────────────────────────────────────────────
-run_step "EC2 Nginx webhook proxy" "${INFRA}/03-ec2.sh"
+# ── Step 4: Webhook handler Lambda + API Gateway ──────────────────────────────
+run_step "Lambda — Webhook Handler + API Gateway (Person A)" "${INFRA}/04-lambda.sh"
 
-# ── Step 5: Webhook handler Lambda ───────────────────────────────────────────
-run_step "Lambda — Webhook Handler (Person A)" "${INFRA}/04-lambda.sh"
-
-# ── Step 6: SAST scanner Lambda ──────────────────────────────────────────────
+# ── Step 5: SAST scanner Lambda ──────────────────────────────────────────────
 run_step "Lambda — SAST Scanner (Person B)" "${INFRA}/07-lambda-scanner.sh"
 
-# ── Step 7: Notifier Lambda + S3 trigger ─────────────────────────────────────
+# ── Step 6: Notifier Lambda + S3 trigger ─────────────────────────────────────
 run_step "Lambda — Notifier + S3 trigger (Person C)" "${INFRA}/08-lambda-notifier.sh"
 
-# ── Step 8: CloudWatch logging + alarms ──────────────────────────────────────
+# ── Step 7: CloudWatch logging + alarms ──────────────────────────────────────
 run_step "CloudWatch log groups and alarms" "${INFRA}/05-cloudwatch.sh"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -85,20 +82,20 @@ source "${STATE_FILE}"
 echo ""
 echo "╔══════════════════════════════════════════════════════════════════╗"
 echo "║                    Deployment Complete!                         ║"
-echo "╠══════════════════════════════════════════════════════════════════╣"
-echo "║  Public webhook URL:                                            ║"
-echo "║    http://${EC2_PUBLIC_IP}/webhook                              ║"
-echo "║                                                                  ║"
-echo "║  Configure GitHub:                                              ║"
-echo "║    Repo → Settings → Webhooks → Add webhook                     ║"
-echo "║    Payload URL : http://${EC2_PUBLIC_IP}/webhook                ║"
-echo "║    Content type: application/json                               ║"
-echo "║    Secret      : (value from SSM ${WEBHOOK_SECRET_PARAM})      ║"
-echo "║    Events      : Pull requests + Pushes                         ║"
-echo "║                                                                  ║"
-echo "║  S3 reports bucket : s3://${S3_BUCKET_NAME}                    ║"
-echo "║  SNS topic         : ${SNS_TOPIC_ARN}                          ║"
 echo "╚══════════════════════════════════════════════════════════════════╝"
+echo ""
+echo "  Public webhook URL (API Gateway HTTP API):"
+echo "    ${WEBHOOK_URL}"
+echo ""
+echo "  Configure GitHub:"
+echo "    Repo → Settings → Webhooks → Add webhook"
+echo "    Payload URL : ${WEBHOOK_URL}"
+echo "    Content type: application/json"
+echo "    Secret      : (value from SSM ${WEBHOOK_SECRET_PARAM})"
+echo "    Events      : Pull requests + Pushes"
+echo ""
+echo "  S3 reports bucket : s3://${S3_BUCKET_NAME}"
+echo "  SNS topic         : ${SNS_TOPIC_ARN}"
 echo ""
 echo "NOTE: If NOTIFICATION_EMAIL was set, check your inbox to confirm"
 echo "      the SNS subscription before security alerts will be sent."

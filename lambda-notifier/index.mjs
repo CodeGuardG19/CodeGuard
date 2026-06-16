@@ -136,11 +136,12 @@ Please review and remediate the above before merging.
 ${highCount > 0 ? "⚠️ **Action required: high-severity vulnerabilities detected. Please remediate before merging.**" : "✅ No high-severity findings. Safe to merge."}
 `;
 
-      await postGitHubComment(owner, repo, prNumber, comment, token).catch((e) =>
-        console.error("GitHub PR comment failed:", e.message)
-      );
-
-      console.log(`PR comment posted: repo=${report.repo} pr=${prNumber}`);
+      try {
+        await postGitHubComment(owner, repo, prNumber, comment, token);
+        console.log(`PR comment posted: repo=${report.repo} pr=${prNumber}`);
+      } catch (e) {
+        console.error("GitHub PR comment failed:", e.message);
+      }
     }
   } else {
     console.log(`No prNumber in metadata — skipping PR comment (push event)`);

@@ -10,10 +10,18 @@ CodeGuard is a cloud-native SAST (Static Application Security Testing) pipeline 
 
 | Tool | Version | Install |
 |------|---------|---------|
-| AWS CLI v2 | ≥ 2.x | [docs.aws.amazon.com/cli](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html) |
+| AWS CLI v2 | ≥ 2.1 (`apigatewayv2` support) | [docs.aws.amazon.com/cli](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html) |
 | Docker | ≥ 24.x | [docs.docker.com](https://docs.docker.com/get-docker/) |
 | Node.js | ≥ 18.x | [nodejs.org](https://nodejs.org/) |
 | git | any | — |
+
+> **AWS Academy Lab users:** ingress is an **API Gateway HTTP API**, not a Lambda
+> Function URL. The Academy SCP **blocks anonymous Function URL invocation**
+> (`AuthType=NONE` requests are rejected with `403 Forbidden` at the AWS platform
+> layer, before reaching your code), so a Function URL is not usable in the Lab.
+> API Gateway invokes the Lambda via the `apigateway.amazonaws.com` principal, so
+> it is not affected by that SCP. The `apigatewayv2` commands ship in the Lab's
+> default CLI (`2.1.11`), so **no CLI upgrade is required**.
 
 ### Step 1 — Clone the repository
 
@@ -77,9 +85,8 @@ chmod +x deploy.sh
 The script takes 10–15 minutes. It prints a summary at the end:
 
 ```
-╔═══════════════════════════════════════════════════════════╗
-║  Public webhook URL: http://<EC2-IP>/webhook              ║
-╚═══════════════════════════════════════════════════════════╝
+  Public webhook URL (API Gateway HTTP API):
+    https://<id>.execute-api.us-east-1.amazonaws.com/webhook
 ```
 
 ### Step 6 — Configure GitHub webhook
@@ -87,13 +94,13 @@ The script takes 10–15 minutes. It prints a summary at the end:
 In the target GitHub repository, where you want this SAST scanner to run:
 
 1. Go to **Settings → Webhooks → Add webhook**
-2. Set **Payload URL** to `http://<EC2-IP>/webhook` (HTTP, not HTTPS — no TLS cert in Lab)
+2. Set **Payload URL** to the API Gateway URL printed by `deploy.sh` (HTTPS, e.g. `https://<id>.execute-api.us-east-1.amazonaws.com/webhook`)
 3. Set **Content type** to `application/json`
 4. Set **Secret** to the value you put in SSM in Step 4
 5. Under **Which events**, select **Let me select individual events** → check **Pull requests**
 6. Click **Add webhook**
 
-GitHub will immediately send a ping event. The webhook should show a green checkmark and a `202 Accepted` response. If it shows a red ✗, check that the EC2 Elastic IP is correct and nginx is running.
+GitHub will immediately send a ping event. The webhook should show a green checkmark and a `202 Accepted` response. If it shows a red ✗, check that the API Gateway URL is correct (it must end in `/webhook`) and the webhook secret matches the SSM value.
 
 ### Step 7 — Confirm SNS subscription
 
@@ -125,8 +132,8 @@ git push origin test/security-scan
 
 | Time | Event |
 |------|-------|
-| 0 s | GitHub fires a `pull_request` webhook to the EC2 endpoint |
-| ~1 s | EC2 proxy forwards it to the Webhook Handler Lambda; GitHub receives `202 Accepted` |
+| 0 s | GitHub fires a `pull_request` webhook to the API Gateway endpoint |
+| ~1 s | API Gateway invokes the Webhook Handler Lambda; GitHub receives `202 Accepted` |
 | ~2 s | Webhook Handler verifies HMAC, creates a job record in S3, invokes the SAST Scanner |
 | ~30–60 s | SAST Scanner downloads the repo, runs the rule engine, writes the report to S3 |
 | ~60–90 s | Notifier Lambda reads the report, posts a comment on the PR, sends an SNS email if HIGH severity findings exist |
@@ -162,8 +169,8 @@ GitHub Repo
 (push / pull_request event)
         │
         ▼
-   EC2 Nginx Proxy
-   (HTTPS, rate limiting)
+ API Gateway (HTTP API)
+ (public HTTPS, POST /webhook)
         │
         ▼
 Lambda — Webhook Handler       ← Person A (Aqeel)
@@ -189,7 +196,7 @@ Lambda — Notifier              ← Person C (Bala)
 
 ### Data Flow
 
-1. Developer opens a PR → GitHub fires a `POST` to the Nginx webhook endpoint
+1. Developer opens a PR → GitHub fires a `POST` to the public API Gateway endpoint (`POST /webhook`)
 2. **Webhook Handler** verifies the HMAC-SHA256 signature, creates a `PENDING` job in S3 (`jobs/{jobId}/metadata.json`), and async-invokes the Scanner
 3. **SAST Scanner** downloads the repo tarball from GitHub, runs the rule engine, saves `jobs/{jobId}/report.json` to S3, and updates metadata to `SUCCESS`
 4. The S3 `ObjectCreated` event fires the **Notifier**
@@ -210,9 +217,8 @@ CodeGuard/
 │   ├── config.env              # ← Edit AWS_ACCOUNT_ID and NOTIFICATION_EMAIL here
 │   ├── state.env               # Auto-generated resource IDs (do not edit)
 │   ├── 01-vpc.sh               # VPC, subnets, IGW, NAT Gateway, VPC endpoints
-│   ├── 02-security.sh          # Security groups (EC2, Lambda)
-│   ├── 03-ec2.sh               # EC2 Nginx proxy
-│   ├── 04-lambda.sh            # Webhook Handler Lambda (ECR image)
+│   ├── 02-security.sh          # Security group (Lambda)
+│   ├── 04-lambda.sh            # Webhook Handler Lambda (ECR image) + API Gateway HTTP API
 │   ├── 05-cloudwatch.sh        # CloudWatch log groups and alarms
 │   ├── 06-s3-sns.sh            # Shared S3 bucket + SNS topic
 │   ├── 07-lambda-scanner.sh    # SAST Scanner Lambda (ECR image)
@@ -265,7 +271,7 @@ The scanner detects the following vulnerability types in JavaScript/TypeScript:
 
 | Resource | Name | Purpose |
 |----------|------|---------|
-| EC2 (t3.micro) | `codeguard-ec2` | Nginx HTTP proxy + webhook proxy service, rate limiting, HMAC forwarding |
+| API Gateway (HTTP API) | `codeguard-webhook-api` | Public HTTPS ingress (`POST /webhook`) — the GitHub webhook target |
 | Lambda | `codeguard-webhook-handler` | Validates webhook, creates job, invokes scanner |
 | Lambda | `codeguard-sast-scanner` | Downloads repo, runs SAST, writes report |
 | Lambda | `codeguard-notifier` | Posts PR comment, sends SNS alert |
@@ -325,6 +331,6 @@ All Lambdas run in a private VPC subnet with a NAT Gateway for outbound internet
 
 | Member | Scope |
 |--------|-------|
-| Person A (Aqeel) | API Gateway · EC2 Nginx · Webhook Handler Lambda · HMAC verification · VPC networking |
+| Person A (Aqeel) | API Gateway (HTTP API) · Webhook Handler Lambda · HMAC verification · VPC networking |
 | Person B (Ke Xu) | SAST Scanner Lambda · ECR · Docker · GitHub code download · SAST rule engine |
 | Person C (Bala) | Notifier Lambda · SNS alerts · GitHub PR comments · S3 event trigger |

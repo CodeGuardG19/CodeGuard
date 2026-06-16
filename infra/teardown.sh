@@ -37,10 +37,21 @@ try "Retry rule"                aws events delete-rule    --name codeguard-scan-
 try "Scanner warmup targets"    aws events remove-targets --rule codeguard-scanner-warmup      --ids SastScannerWarmup       --region "${AWS_REGION}"
 try "Scanner warmup rule"       aws events delete-rule    --name codeguard-scanner-warmup                                    --region "${AWS_REGION}"
 
-# ── Lambda Function URLs ───────────────────────────────────────────────────────
-step "Deleting Lambda Function URLs..."
-try "Webhook Function URL" aws lambda delete-function-url-config \
-  --function-name "${WEBHOOK_LAMBDA_NAME:-codeguard-webhook-handler}" --region "${AWS_REGION}"
+# ── API Gateway (webhook ingress) ─────────────────────────────────────────────
+step "Deleting API Gateway HTTP API..."
+WEBHOOK_API_ID="${WEBHOOK_API_ID:-}"
+if [ -z "${WEBHOOK_API_ID}" ]; then
+  WEBHOOK_API_ID=$(aws apigatewayv2 get-apis \
+    --region "${AWS_REGION}" \
+    --query "Items[?Name=='codeguard-webhook-api'].ApiId | [0]" \
+    --output text 2>/dev/null || echo "None")
+fi
+if [ -n "${WEBHOOK_API_ID}" ] && [ "${WEBHOOK_API_ID}" != "None" ]; then
+  try "Webhook API Gateway (${WEBHOOK_API_ID})" aws apigatewayv2 delete-api \
+    --api-id "${WEBHOOK_API_ID}" --region "${AWS_REGION}"
+else
+  ok "No API Gateway to delete"
+fi
 
 # ── Lambda functions ───────────────────────────────────────────────────────────
 step "Deleting Lambda functions..."
@@ -77,7 +88,6 @@ try "CloudWatch alarms" aws cloudwatch delete-alarms \
   --alarm-names \
     codeguard-lambda-error-rate \
     codeguard-lambda-p95-duration \
-    codeguard-ec2-cpu-high \
     codeguard-scanner-error-rate \
     codeguard-notifier-error-rate \
   --region "${AWS_REGION}"
@@ -87,9 +97,7 @@ step "Deleting CloudWatch log groups..."
 for LG in \
   "/codeguard/lambda/webhook-handler" \
   "/codeguard/lambda/sast-scanner" \
-  "/codeguard/lambda/notifier" \
-  "/codeguard/ec2/nginx-access" \
-  "/codeguard/ec2/nginx-error"; do
+  "/codeguard/lambda/notifier"; do
   try "Log group ${LG}" aws logs delete-log-group \
     --log-group-name "${LG}" --region "${AWS_REGION}"
 done
@@ -106,25 +114,7 @@ try "Scanner ECR repo" aws ecr delete-repository \
 # ── SSM parameters ────────────────────────────────────────────────────────────
 step "Deleting SSM parameters..."
 try "Webhook secret param"  aws ssm delete-parameter --name "${WEBHOOK_SECRET_PARAM:-/codeguard/github-webhook-secret}" --region "${AWS_REGION}"
-try "CW agent config param" aws ssm delete-parameter --name "/codeguard/cw-agent-config"                                --region "${AWS_REGION}"
 try "GitHub token param"    aws ssm delete-parameter --name "${GITHUB_TOKEN_PARAM:-/codeguard/github-token}"            --region "${AWS_REGION}"
-
-# ── EC2 instance ──────────────────────────────────────────────────────────────
-if [ -n "${EC2_INSTANCE_ID:-}" ]; then
-  step "Terminating EC2 instance ${EC2_INSTANCE_ID}..."
-  try "EC2 terminate" aws ec2 terminate-instances \
-    --instance-ids "${EC2_INSTANCE_ID}" --region "${AWS_REGION}"
-  echo "  Waiting for EC2 to reach terminated state..."
-  aws ec2 wait instance-terminated \
-    --instance-ids "${EC2_INSTANCE_ID}" --region "${AWS_REGION}" 2>/dev/null \
-    && ok "EC2 terminated" || fail "EC2 wait terminated"
-fi
-
-if [ -n "${EC2_EIP_ALLOC_ID:-}" ]; then
-  step "Releasing EC2 Elastic IP..."
-  try "EC2 EIP release" aws ec2 release-address \
-    --allocation-id "${EC2_EIP_ALLOC_ID}" --region "${AWS_REGION}"
-fi
 
 # ── IAM ───────────────────────────────────────────────────────────────────────
 # LabRole and LabInstanceProfile are course-managed — not deleted.
@@ -175,7 +165,7 @@ fi
 
 # ── Security Groups ────────────────────────────────────────────────────────────
 step "Deleting security groups..."
-for SG_ID in "${LAMBDA_SG_ID:-}" "${EC2_SG_ID:-}" "${SNS_ENDPOINT_SG_ID:-}"; do
+for SG_ID in "${LAMBDA_SG_ID:-}" "${SNS_ENDPOINT_SG_ID:-}"; do
   [ -z "${SG_ID}" ] && continue
   try "Security group ${SG_ID}" aws ec2 delete-security-group \
     --group-id "${SG_ID}" --region "${AWS_REGION}"
