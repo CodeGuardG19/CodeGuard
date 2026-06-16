@@ -45,8 +45,32 @@ async function postGitHubComment(owner, repo, prNumber, body, token) {
   }
 }
 
+// Sets the "CodeGuard Security Scan" commit status on the scanned SHA.
+// When this context is required in branch protection rules, a "failure" state
+// prevents the PR from being merged until findings are resolved.
+async function createGitHubStatus(owner, repo, sha, state, description, token) {
+  const response = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/statuses/${sha}`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        state,
+        description,
+        context: "CodeGuard Security Scan",
+      }),
+    }
+  );
+  if (!response.ok) {
+    throw new Error(`GitHub API ${response.status}: ${await response.text()}`);
+  }
+}
+
 function getJobIdFromS3Key(key) {
-  // key format: jobs/{jobId}/report.json
   const parts = key.split("/");
   if (parts.length < 3) throw new Error(`Unexpected S3 key format: ${key}`);
   return parts[1];
@@ -73,12 +97,14 @@ export const handler = async (event) => {
   );
   const metadata = JSON.parse(await streamToString(metaRes.Body));
 
-  const prNumber = metadata.prNumber ?? null;
+  const prNumber  = metadata.prNumber ?? null;
+  const commitSha = metadata.commitSha;
   const highCount = report.summary?.high ?? 0;
+  const passed    = highCount === 0;
 
   // ── SNS alert for high-severity findings ─────────────────────────────────
-  if (highCount > 0) {
-    const topFinding = report.findings?.[0];
+  if (!passed) {
+    const top = report.findings?.[0];
     const emailMessage = `
 CodeGuard Security Scan Report
 
@@ -90,10 +116,10 @@ Low Severity:    ${report.summary.low}
 
 Most Critical Finding
 ---------------------
-Severity:    ${topFinding?.severity ?? "N/A"}
-Type:        ${topFinding?.type ?? "N/A"}
-Location:    ${topFinding?.file ?? "N/A"}${topFinding?.line ? ` (Line ${topFinding.line})` : ""}
-Description: ${topFinding?.message ?? "No description available"}
+Severity:    ${top?.severity ?? "N/A"}
+Type:        ${top?.type ?? "N/A"}
+Location:    ${top?.file ?? "N/A"}${top?.line ? ` (Line ${top.line})` : ""}
+Description: ${top?.message ?? "No description available"}
 
 Please review and remediate the above before merging.
 
@@ -111,18 +137,45 @@ Please review and remediate the above before merging.
     console.log(`SNS alert sent for jobId=${jobId} (${highCount} high-severity findings)`);
   }
 
-  // ── GitHub PR comment (only when triggered by a pull_request event) ───────
-  if (prNumber) {
-    const token = await getGithubToken();
-    if (!token) {
-      console.warn("No GitHub token available — skipping PR comment");
-    } else {
-      const [owner, repo] = report.repo.split("/");
-      const topIssue = report.findings?.[0]?.message ?? "No findings";
+  // ── GitHub commit status (merge gate) + PR comment ───────────────────────
+  if (!prNumber) {
+    console.log("No prNumber in metadata — skipping PR comment and status check (push event)");
+    return { statusCode: 200, jobId, prNumber: null, highCount };
+  }
 
-      const comment = `## CodeGuard Scan Results
+  const token = await getGithubToken();
+  if (!token) {
+    console.warn("No GitHub token available — skipping PR comment and status check");
+    return { statusCode: 200, jobId, prNumber, highCount };
+  }
+
+  const [owner, repo] = report.repo.split("/");
+
+  // Set commit status — blocks merge when state="failure" and the
+  // "CodeGuard Security Scan" context is required in branch protection.
+  await createGitHubStatus(
+    owner, repo, commitSha,
+    passed ? "success" : "failure",
+    passed
+      ? "No high-severity findings — safe to merge"
+      : `${highCount} high-severity finding(s) detected — merge blocked`,
+    token
+  ).catch((e) => console.error("GitHub status update failed:", e.message));
+
+  console.log(`GitHub status set to "${passed ? "success" : "failure"}" for sha=${commitSha}`);
+
+  // Post PR comment with clear pass/fail result
+  const statusLine = passed
+    ? "✅ **No high-severity findings detected. This PR is safe to merge.**"
+    : `❌ **${highCount} high-severity finding(s) detected. Merge is blocked until resolved.**`;
+
+  const topIssue = report.findings?.[0]?.message ?? "No findings";
+
+  const comment = `## CodeGuard Scan Results
 
 **Repository:** ${report.repo}
+
+${statusLine}
 
 | Severity | Count |
 |----------|-------|
@@ -132,19 +185,13 @@ Please review and remediate the above before merging.
 | **Total**| **${report.summary?.total ?? 0}** |
 
 **Top Issue:** ${topIssue}
-
-${highCount > 0 ? "⚠️ **Action required: high-severity vulnerabilities detected. Please remediate before merging.**" : "✅ No high-severity findings. Safe to merge."}
 `;
 
-      await postGitHubComment(owner, repo, prNumber, comment, token).catch((e) =>
-        console.error("GitHub PR comment failed:", e.message)
-      );
+  await postGitHubComment(owner, repo, prNumber, comment, token).catch((e) =>
+    console.error("GitHub PR comment failed:", e.message)
+  );
 
-      console.log(`PR comment posted: repo=${report.repo} pr=${prNumber}`);
-    }
-  } else {
-    console.log(`No prNumber in metadata — skipping PR comment (push event)`);
-  }
+  console.log(`PR comment posted: repo=${report.repo} pr=${prNumber}`);
 
   return { statusCode: 200, jobId, prNumber, highCount };
 };
