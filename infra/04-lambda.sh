@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 04-lambda.sh — Builds and pushes Docker image to ECR, creates/updates Lambda,
-#                configures Function URL, and sets up EventBridge rules for
+#                creates API Gateway HTTP API, and sets up EventBridge rules for
 #                warm-up pings and SCAN_FAILED retry events.
 set -euo pipefail
 
@@ -133,15 +133,64 @@ aws lambda put-function-event-invoke-config \
 
 save WEBHOOK_LAMBDA_ARN "${WEBHOOK_LAMBDA_ARN}"
 
-# Allow EC2 proxy (LabRole) to invoke this Lambda directly.
-# This replaces Lambda Function URLs which are blocked by Academy SCPs.
-log "Granting EC2 proxy (LabRole) permission to invoke webhook Lambda..."
+# ── API Gateway: HTTP API (replaces EC2 Nginx proxy) ─────────────────────────
+# API Gateway accepts GitHub's anonymous HTTPS request, then invokes Lambda as
+# the apigateway.amazonaws.com service principal — this bypasses the Academy SCP
+# that blocks anonymous Lambda Function URL invocations.
+log "Creating API Gateway HTTP API..."
+EXISTING_API_ID=$(aws apigatewayv2 get-apis \
+  --region "${AWS_REGION}" \
+  --query "Items[?Name=='codeguard-webhook-api'].ApiId" --output text 2>/dev/null || echo "")
+
+if [ -z "${EXISTING_API_ID}" ]; then
+  API_ID=$(aws apigatewayv2 create-api \
+    --name codeguard-webhook-api \
+    --protocol-type HTTP \
+    --region "${AWS_REGION}" \
+    --query 'ApiId' --output text)
+  log "API Gateway created: ${API_ID}"
+else
+  API_ID="${EXISTING_API_ID}"
+  log "API Gateway already exists: ${API_ID}"
+fi
+
+log "Creating AWS_PROXY integration..."
+INTEGRATION_ID=$(aws apigatewayv2 create-integration \
+  --api-id "${API_ID}" \
+  --integration-type AWS_PROXY \
+  --integration-uri "${WEBHOOK_LAMBDA_ARN}" \
+  --integration-method POST \
+  --payload-format-version 2.0 \
+  --region "${AWS_REGION}" \
+  --query 'IntegrationId' --output text)
+
+log "Creating POST /webhook route..."
+aws apigatewayv2 create-route \
+  --api-id "${API_ID}" \
+  --route-key 'POST /webhook' \
+  --target "integrations/${INTEGRATION_ID}" \
+  --region "${AWS_REGION}" > /dev/null
+
+log "Creating \$default stage with auto-deploy..."
+aws apigatewayv2 create-stage \
+  --api-id "${API_ID}" \
+  --stage-name '$default' \
+  --auto-deploy \
+  --region "${AWS_REGION}" > /dev/null 2>/dev/null || true
+
+log "Granting API Gateway permission to invoke webhook Lambda..."
 aws lambda add-permission \
   --function-name "${WEBHOOK_LAMBDA_NAME}" \
-  --statement-id AllowEC2ProxyInvoke \
+  --statement-id ApiGatewayInvokeWebhook \
   --action lambda:InvokeFunction \
-  --principal "arn:aws:iam::${AWS_ACCOUNT_ID}:role/LabRole" \
+  --principal apigateway.amazonaws.com \
+  --source-arn "arn:aws:execute-api:${AWS_REGION}:${AWS_ACCOUNT_ID}:${API_ID}/*/*/webhook" \
   --region "${AWS_REGION}" 2>/dev/null || true
+
+WEBHOOK_URL="https://${API_ID}.execute-api.${AWS_REGION}.amazonaws.com/webhook"
+log "API Gateway endpoint: ${WEBHOOK_URL}"
+save WEBHOOK_API_ID "${API_ID}"
+save WEBHOOK_URL "${WEBHOOK_URL}"
 
 # ── EventBridge: warm-up ping every 5 minutes ─────────────────────────────────
 log "Creating EventBridge warm-up rule (rate 5 minutes)..."
@@ -203,8 +252,8 @@ save RETRY_RULE_ARN "${RETRY_RULE_ARN}"
 
 log ""
 log "╔═══════════════════════════════════════════════════════════════╗"
-log "║  Public webhook endpoint: http://${EC2_PUBLIC_IP}/webhook     ║"
-log "║  Configure GitHub webhook to POST to this HTTP URL.           ║"
+log "║  Public webhook endpoint: ${WEBHOOK_URL}"
+log "║  Configure GitHub webhook to POST to this HTTPS URL.          ║"
 log "╚═══════════════════════════════════════════════════════════════╝"
 
 log "04-lambda.sh complete."

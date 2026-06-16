@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 06-s3-sns.sh — Creates the shared S3 reports bucket and SNS alerts topic.
+# 03-s3-sns.sh — Creates the shared S3 reports bucket and SNS alerts topic.
 # Run BEFORE the Lambda scripts so SNS_TOPIC_ARN is available to them.
 set -euo pipefail
 
@@ -9,7 +9,7 @@ source "${SCRIPT_DIR}/state.env"
 
 STATE_FILE="${SCRIPT_DIR}/state.env"
 
-log()  { echo "[06-s3-sns] $*"; }
+log()  { echo "[03-s3-sns] $*"; }
 save() { echo "export $1=\"$2\"" >> "${STATE_FILE}"; }
 
 # ── S3 bucket ─────────────────────────────────────────────────────────────────
@@ -79,4 +79,4 @@ else
   log "WARNING: NOTIFICATION_EMAIL not set in config.env — skipping email subscription."
 fi
 
-log "06-s3-sns.sh complete."
+log "03-s3-sns.sh complete."

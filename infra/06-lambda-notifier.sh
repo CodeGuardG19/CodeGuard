@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 08-lambda-notifier.sh — Packages and deploys the notifier Lambda (zip, nodejs22.x),
+# 06-lambda-notifier.sh — Packages and deploys the notifier Lambda (zip, nodejs22.x),
 #                         then wires the S3 trigger for jobs/*/report.json events.
 set -euo pipefail
 
@@ -9,16 +9,16 @@ source "${SCRIPT_DIR}/state.env"
 
 STATE_FILE="${SCRIPT_DIR}/state.env"
 
-log()  { echo "[08-lambda-notifier] $*"; }
+log()  { echo "[06-lambda-notifier] $*"; }
 save() { echo "export $1=\"$2\"" >> "${STATE_FILE}"; }
 
 NOTIFIER_DIR="${SCRIPT_DIR}/../lambda-notifier"
 ZIP_PATH="/tmp/codeguard-notifier.zip"
 NOTIFIER_LAMBDA_ARN="arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${NOTIFIER_LAMBDA_NAME}"
 
-# ── Verify SNS_TOPIC_ARN is available (set by 06-s3-sns.sh) ──────────────────
+# ── Verify SNS_TOPIC_ARN is available (set by 03-s3-sns.sh) ──────────────────
 if [ -z "${SNS_TOPIC_ARN:-}" ]; then
-  echo "ERROR: SNS_TOPIC_ARN not found in state.env. Run 06-s3-sns.sh first."
+  echo "ERROR: SNS_TOPIC_ARN not found in state.env. Run 03-s3-sns.sh first."
   exit 1
 fi
 
@@ -47,7 +47,7 @@ if [ -z "${EXISTING}" ]; then
     --role "${LAMBDA_ROLE_ARN}" \
     --memory-size "${LAMBDA_MEMORY}" \
     --timeout "${NOTIFIER_LAMBDA_TIMEOUT}" \
-    --environment "Variables={BUCKET_NAME=${S3_BUCKET_NAME},SNS_TOPIC_ARN=${SNS_TOPIC_ARN},GITHUB_TOKEN_PARAM=${GITHUB_TOKEN_PARAM}}" \
+    --environment "Variables={S3_BUCKET_NAME=${S3_BUCKET_NAME},SNS_TOPIC_ARN=${SNS_TOPIC_ARN},GITHUB_TOKEN_PARAM=${GITHUB_TOKEN_PARAM}}" \
     --tags "Project=${PROJECT_TAG}" \
     --region "${AWS_REGION}"
 
@@ -71,7 +71,7 @@ else
     --function-name "${NOTIFIER_LAMBDA_NAME}" \
     --memory-size "${LAMBDA_MEMORY}" \
     --timeout "${NOTIFIER_LAMBDA_TIMEOUT}" \
-    --environment "Variables={BUCKET_NAME=${S3_BUCKET_NAME},SNS_TOPIC_ARN=${SNS_TOPIC_ARN},GITHUB_TOKEN_PARAM=${GITHUB_TOKEN_PARAM}}" \
+    --environment "Variables={S3_BUCKET_NAME=${S3_BUCKET_NAME},SNS_TOPIC_ARN=${SNS_TOPIC_ARN},GITHUB_TOKEN_PARAM=${GITHUB_TOKEN_PARAM}}" \
     --region "${AWS_REGION}"
 
   aws lambda wait function-updated \
@@ -122,4 +122,4 @@ aws s3api put-bucket-notification-configuration \
 
 log "S3 → Lambda trigger configured: s3://${S3_BUCKET_NAME}/jobs/*/report.json"
 
-log "08-lambda-notifier.sh complete."
+log "06-lambda-notifier.sh complete."
