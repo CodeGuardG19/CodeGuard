@@ -5,15 +5,16 @@ All teams can develop independently against these contracts.
 
 ---
 
-## Interface A → B: SAST Scanner invocation
+## Interface A → B: SAST Scanner invocation (via SQS)
 
-**Trigger**: Webhook Handler Lambda (Person A) invokes Scanner Lambda (Person B)
-asynchronously (`InvocationType: Event`) after a GitHub webhook is validated.
+**Trigger**: Webhook Handler Lambda (Person A) sends a message to the SQS queue
+`codeguard-scan-jobs` after a GitHub webhook is validated. The Scanner Lambda
+(Person B) is wired to the queue with an event source mapping, so AWS delivers
+each message as a normal SQS event (`event.Records[].body`).
 
-**Lambda name**: value of environment variable `SAST_LAMBDA_NAME`
-(default: `codeguard-sast-scanner`).
+**Queue URL**: value of environment variable `SCAN_QUEUE_URL`.
 
-**Invocation payload** (JSON):
+**Message body** (JSON string in `Records[].body`):
 ```json
 {
   "jobId":     "550e8400-e29b-41d4-a716-446655440000",
@@ -28,16 +29,11 @@ asynchronously (`InvocationType: Event`) after a GitHub webhook is validated.
 | `repo`      | string | GitHub repository in `owner/repo` format.        |
 | `commitSha` | string | Full 40-character commit SHA being scanned.      |
 
-**What Person B must do on failure**: publish a `SCAN_FAILED` custom event to
-the default EventBridge bus so Person A's retry rule can pick it up:
-
-```json
-{
-  "Source":     "codeguard.scanner",
-  "DetailType": "SCAN_FAILED",
-  "Detail":     "{\"jobId\": \"<uuid>\"}"
-}
-```
+**What Person B must do on failure**: simply **throw** (or let the error
+propagate) so the SQS message is not deleted. SQS redelivers it after the
+visibility timeout, and after 3 failed receives routes it to the dead-letter
+queue `codeguard-scan-dlq` — which raises a CloudWatch alarm to the SNS topic.
+No custom retry event is needed.
 
 ---
 
@@ -59,7 +55,6 @@ report. Person C reads metadata to obtain `prNumber` for posting PR comments.
   "branch":      "feature/my-branch",
   "prNumber":    42,
   "triggeredAt": "2024-01-15T10:30:00.000Z",
-  "retryCount":  0,
   "updatedAt":   "2024-01-15T10:30:01.000Z"
 }
 ```
@@ -68,12 +63,10 @@ report. Person C reads metadata to obtain `prNumber` for posting PR comments.
 
 | Status               | Set by   | Meaning                                           |
 |----------------------|----------|---------------------------------------------------|
-| `PENDING`            | Person A | Webhook received, SAST scan dispatched.           |
-| `RETRYING`           | Person A | Retry attempt in progress (`retryCount` > 0).     |
-| `FAILED`             | Person A | SAST Lambda invocation failed.                    |
-| `PERMANENTLY_FAILED` | Person A | Retries exhausted (`retryCount` ≥ 3). SNS notified. |
+| `PENDING`            | Person A | Webhook received, scan job enqueued on SQS.       |
+| `FAILED`             | Person A | Could not enqueue the scan job on SQS.            |
 | `SUCCESS`            | Person B | Scan finished successfully. Report in S3.         |
-| `FAILED`             | Person B | Scanner encountered an internal error.            |
+| `FAILED`             | Person B | Scanner encountered an internal error (SQS will redeliver / DLQ). |
 
 ---
 
@@ -118,18 +111,19 @@ The Notifier is triggered by the S3 `ObjectCreated` event on any key matching
 
 ## Lambda environment variables
 
-| Lambda | Variable | Source | Value |
-|--------|----------|--------|-------|
-| Webhook Handler | `S3_BUCKET_NAME` | config.env | `codeguard-reports-<account>` |
-| Webhook Handler | `SAST_LAMBDA_NAME` | config.env | `codeguard-sast-scanner` |
-| Webhook Handler | `AWS_REGION_NAME` | config.env | `us-east-1` |
-| Webhook Handler | `WEBHOOK_SECRET_PARAM` | config.env | `/codeguard/github-webhook-secret` |
-| Webhook Handler | `SNS_TOPIC_ARN` | state.env | `arn:aws:sns:us-east-1:<account>:codeguard-alerts` |
-| SAST Scanner | `S3_BUCKET_NAME` | config.env | `codeguard-reports-<account>` |
-| SAST Scanner | `GITHUB_TOKEN_PARAM` | config.env | `/codeguard/github-token` |
-| Notifier | `S3_BUCKET_NAME` | config.env | `codeguard-reports-<account>` |
-| Notifier | `SNS_TOPIC_ARN` | state.env | `arn:aws:sns:us-east-1:<account>:codeguard-alerts` |
-| Notifier | `GITHUB_TOKEN_PARAM` | config.env | `/codeguard/github-token` |
+All values are set by Terraform on each Lambda (`terraform/lambda.tf`).
+
+| Lambda | Variable | Value |
+|--------|----------|-------|
+| Webhook Handler | `S3_BUCKET_NAME` | `codeguard-reports-<account>` |
+| Webhook Handler | `SCAN_QUEUE_URL` | `https://sqs.us-east-1.amazonaws.com/<account>/codeguard-scan-jobs` |
+| Webhook Handler | `AWS_REGION_NAME` | `us-east-1` |
+| Webhook Handler | `WEBHOOK_SECRET_PARAM` | `/codeguard/github-webhook-secret` |
+| SAST Scanner | `S3_BUCKET_NAME` | `codeguard-reports-<account>` |
+| SAST Scanner | `GITHUB_TOKEN_PARAM` | `/codeguard/github-token` |
+| Notifier | `S3_BUCKET_NAME` | `codeguard-reports-<account>` |
+| Notifier | `SNS_TOPIC_ARN` | `arn:aws:sns:us-east-1:<account>:codeguard-alerts` |
+| Notifier | `GITHUB_TOKEN_PARAM` | `/codeguard/github-token` |
 
 ---
 
@@ -139,18 +133,9 @@ The Notifier is triggered by the S3 `ObjectCreated` event on any key matching
 
 **Topic ARN**: `arn:aws:sns:<region>:<account-id>:codeguard-alerts`
 
-Person A publishes to this topic when `status = PERMANENTLY_FAILED`.
+The `codeguard-scan-dlq-not-empty` CloudWatch alarm publishes to this topic when
+a scan job lands in the dead-letter queue (failed 3 times).
 Person C publishes to this topic when `summary.high > 0` in a scan report.
-
-**Person A — permanent failure alert** (plain text):
-```json
-{
-  "jobId":      "<uuid>",
-  "repo":       "owner/repo",
-  "commitSha":  "abc123...",
-  "retryCount": 3
-}
-```
 
 **Person C — high severity alert** (plain text email body):
 ```

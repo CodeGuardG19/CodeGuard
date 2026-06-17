@@ -1,17 +1,18 @@
 // Lambda entry point for the SAST Scanner.
 // Handles two event types:
-//   1) Normal scan: { jobId, repo, commitSha } — download → scan → write S3 → update status
+//   1) Scan job from SQS: Records[].body = { jobId, repo, commitSha }
+//      — download → scan → write S3 → update status. A thrown error lets SQS
+//        redeliver the message (visibility timeout) and, after maxReceiveCount,
+//        route it to the dead-letter queue.
 //   2) Warm-up ping: event.source === 'aws.events' — return 200 immediately
 
 import fs from 'fs';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
-import { EventBridgeClient, PutEventsCommand } from '@aws-sdk/client-eventbridge';
 import { fetchRepo } from './githubClient.js';
 import { runScan } from './scanner.js';
 import * as jobStore from './jobStore.js';
 
 const ssm = new SSMClient({});
-const eb = new EventBridgeClient({});
 
 // Cache the GitHub token across warm invocations — fetched once from SSM.
 let tokenPromise;
@@ -38,10 +39,30 @@ export const handler = async (event) => {
     return { statusCode: 200, body: 'warm' };
   }
 
+  // Scan jobs arrive from SQS. batch_size = 1, but iterate defensively; a thrown
+  // error fails the message so SQS redelivers it (and eventually DLQs it).
+  if (!event?.Records?.length) {
+    throw new Error(`Invalid event: expected SQS Records, got ${JSON.stringify(event)}`);
+  }
+
+  for (const record of event.Records) {
+    let job;
+    try {
+      job = JSON.parse(record.body);
+    } catch {
+      throw new Error(`Invalid SQS message body: ${record.body}`);
+    }
+    await processScan(job);
+  }
+
+  return { statusCode: 200 };
+};
+
+async function processScan(event) {
   const { jobId, repo, commitSha } = event || {};
   if (!jobId || !repo || !commitSha) {
     throw new Error(
-      `Invalid event: expected { jobId, repo, commitSha }, got ${JSON.stringify(event)}`
+      `Invalid scan job: expected { jobId, repo, commitSha }, got ${JSON.stringify(event)}`
     );
   }
 
@@ -93,20 +114,10 @@ export const handler = async (event) => {
       })
       .catch((e) => console.error('updateJob(FAILED) also failed:', e));
 
-    // Publish SCAN_FAILED event so the webhook handler's retry rule can pick it up.
-    await eb
-      .send(new PutEventsCommand({
-        Entries: [{
-          Source: 'codeguard.scanner',
-          DetailType: 'SCAN_FAILED',
-          Detail: JSON.stringify({ jobId }),
-          EventBusName: 'default',
-        }],
-      }))
-      .catch((e) => console.error('EventBridge SCAN_FAILED publish failed:', e.message));
-
+    // Re-throw so the SQS message is not deleted: SQS redelivers it after the
+    // visibility timeout and routes it to the DLQ after maxReceiveCount.
     throw err;
   } finally {
     fs.rmSync(`/tmp/${jobId}`, { recursive: true, force: true });
   }
-};
+}
