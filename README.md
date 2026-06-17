@@ -13,6 +13,7 @@ CodeGuard is a cloud-native SAST (Static Application Security Testing) pipeline 
 | AWS CLI v2 | ≥ 2.x | [docs.aws.amazon.com/cli](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html) |
 | Docker | ≥ 24.x | [docs.docker.com](https://docs.docker.com/get-docker/) |
 | Node.js | ≥ 18.x | [nodejs.org](https://nodejs.org/) |
+| Terraform | ≥ 1.5 | [developer.hashicorp.com/terraform](https://developer.hashicorp.com/terraform/install) |
 | git | any | — |
 
 ### Step 1 — Clone the repository
@@ -33,16 +34,18 @@ aws configure          # enter Access Key ID, Secret, region = us-east-1
 # OR export the env vars directly from the Learner Lab "AWS Details" panel
 ```
 
-### Step 3 — Edit `infra/config.env` (Run everytime a new session is started)
+### Step 3 — Set your Terraform variables
 
-Open `infra/config.env` and set **two values**:
+Copy the example tfvars file and set your alert email. Your AWS account ID is
+detected automatically from your credentials — no need to fill it in.
 
 ```bash
-export AWS_ACCOUNT_ID="123456789012"          # your 12-digit AWS account number
-export NOTIFICATION_EMAIL="you@example.com"   # receives SNS security alerts
+cp terraform/terraform.tfvars.example terraform/terraform.tfvars
+# then edit terraform/terraform.tfvars:
+#   notification_email = "you@example.com"   # receives SNS security alerts
 ```
 
-Everything else is pre-configured with sensible defaults.
+Everything else is pre-configured with sensible defaults in `terraform/variables.tf`.
 
 ### Step 4 — Create SSM secrets (run once)
 
@@ -74,13 +77,18 @@ chmod +x deploy.sh
 ./deploy.sh
 ```
 
-The script takes 10–15 minutes. It prints a summary at the end:
+`deploy.sh` is a thin wrapper around Terraform: it creates the ECR repos, builds
+and pushes the two Lambda container images, zips the notifier, then runs
+`terraform apply`. The first run takes 10–15 minutes (mostly the NAT Gateway).
+It prints a summary at the end:
 
 ```
-╔══════════════════════════════════════════════════════════════════╗
-║  Public webhook URL:                                            ║
-║    https://<API_ID>.execute-api.us-east-1.amazonaws.com/webhook ║
-╚══════════════════════════════════════════════════════════════════╝
+════════════════════════════════════════════════════════════════
+ Deployment complete.
+   Webhook URL : https://<API_ID>.execute-api.us-east-1.amazonaws.com/webhook
+   S3 bucket   : codeguard-reports-<ACCOUNT_ID>
+   SNS topic   : arn:aws:sns:us-east-1:<ACCOUNT_ID>:codeguard-alerts
+════════════════════════════════════════════════════════════════
 ```
 
 ### Step 6 — Configure GitHub webhook
@@ -128,8 +136,8 @@ git push origin test/security-scan
 |------|-------|
 | 0 s | GitHub fires a `pull_request` webhook to the API Gateway endpoint |
 | ~1 s | API Gateway forwards it to the Webhook Handler Lambda; GitHub receives `202 Accepted` |
-| ~2 s | Webhook Handler verifies HMAC, creates a job record in S3, invokes the SAST Scanner |
-| ~30–60 s | SAST Scanner downloads the repo, runs the rule engine, writes the report to S3 |
+| ~2 s | Webhook Handler verifies HMAC, creates a job record in S3, enqueues the scan job on SQS |
+| ~30–60 s | SQS triggers the SAST Scanner; it downloads the repo, runs the rule engine, writes the report to S3 |
 | ~60–90 s | Notifier Lambda reads the report, posts a comment on the PR, sends an SNS email if HIGH severity findings exist |
 
 **4. Check results:**
@@ -150,8 +158,11 @@ cat /tmp/report.json
 ### Teardown
 
 ```bash
-bash infra/teardown.sh
+./destroy.sh        # runs `terraform destroy` — removes everything CodeGuard created
 ```
+
+The `LabRole` IAM role and the two SSM secret parameters are provisioned out of
+band and are **not** removed by teardown.
 
 ---
 
@@ -169,7 +180,11 @@ GitHub Repo
 Lambda — Webhook Handler       ← Person A (Aqeel)
 (HMAC signature verification,
  job creation in S3)
-        │  async invoke
+        │  enqueue job
+        ▼
+   SQS — codeguard-scan-jobs
+   (+ DLQ for failed scans)
+        │  event source mapping
         ▼
 Lambda — SAST Scanner          ← Person B (Ke Xu)
 (downloads repo from GitHub,
@@ -190,14 +205,14 @@ Lambda — Notifier              ← Person C (Bala)
 ### Data Flow
 
 1. Developer opens a PR → GitHub fires a `POST` to the API Gateway endpoint
-2. **Webhook Handler** verifies the HMAC-SHA256 signature, creates a `PENDING` job in S3 (`jobs/{jobId}/metadata.json`), and async-invokes the Scanner
-3. **SAST Scanner** downloads the repo tarball from GitHub, runs the rule engine, saves `jobs/{jobId}/report.json` to S3, and updates metadata to `SUCCESS`
+2. **Webhook Handler** verifies the HMAC-SHA256 signature, creates a `PENDING` job in S3 (`jobs/{jobId}/metadata.json`), and **enqueues the job on SQS** (`codeguard-scan-jobs`)
+3. **SAST Scanner** is triggered by SQS, downloads the repo tarball from GitHub, runs the rule engine, saves `jobs/{jobId}/report.json` to S3, and updates metadata to `SUCCESS`
 4. The S3 `ObjectCreated` event fires the **Notifier**
 5. **Notifier** reads the report: if HIGH-severity findings exist, sends SNS email; posts a summary comment on the PR
 
 ### Retry Logic
 
-If the Scanner fails, it publishes a `SCAN_FAILED` EventBridge event. The Webhook Handler retries up to 3 times. On permanent failure it publishes an SNS alert.
+The Scanner consumes scan jobs from an SQS queue. If a scan fails (or the Lambda is throttled/killed), the message is not deleted, so SQS redelivers it after the visibility timeout. After 3 failed attempts the message is routed to the dead-letter queue (`codeguard-scan-dlq`), which raises a CloudWatch alarm to the SNS topic for investigation.
 
 ---
 
@@ -205,31 +220,36 @@ If the Scanner fails, it publishes a `SCAN_FAILED` EventBridge event. The Webhoo
 
 ```
 CodeGuard/
-├── deploy.sh                   # Master deployment script (run this)
-├── infra/
-│   ├── config.env              # ← Edit AWS_ACCOUNT_ID and NOTIFICATION_EMAIL here
-│   ├── state.env               # Auto-generated resource IDs (do not edit)
-│   ├── 01-vpc.sh               # VPC, subnets, IGW, NAT Gateway, VPC endpoints
-│   ├── 02-security.sh          # Lambda security group
-│   ├── 03-s3-sns.sh            # Shared S3 bucket + SNS topic
-│   ├── 04-lambda.sh            # Webhook Handler Lambda (ECR image) + API Gateway
-│   ├── 05-lambda-scanner.sh    # SAST Scanner Lambda (ECR image)
-│   ├── 06-lambda-notifier.sh   # Notifier Lambda (zip) + S3 trigger
-│   ├── 07-cloudwatch.sh        # CloudWatch log groups and alarms
-│   └── teardown.sh             # Tear down all infrastructure
+├── deploy.sh                   # Build/push images + zip notifier, then `terraform apply`
+├── destroy.sh                  # `terraform destroy`
+├── terraform/                  # All infrastructure as code (declarative)
+│   ├── terraform.tfvars.example  # ← Copy to terraform.tfvars and set notification_email
+│   ├── versions.tf             # Terraform + provider versions, default tags
+│   ├── variables.tf            # All tunables (region, names, timeouts, SSM param names)
+│   ├── locals.tf               # Account ID, region, LabRole lookup, bucket name
+│   ├── vpc.tf                  # VPC, subnets, IGW, NAT Gateway, route tables, VPC endpoints
+│   ├── security.tf             # Lambda + SNS-endpoint security groups
+│   ├── s3-sns.tf               # Reports bucket, SNS topic + sub, S3→notifier notification
+│   ├── sqs.tf                  # Scan-job queue + DLQ, scanner event source mapping, DLQ alarm
+│   ├── ecr.tf                  # ECR repos + image-digest data sources
+│   ├── lambda.tf               # Three Lambdas + permissions + retry config
+│   ├── apigateway.tf           # HTTP API, integration, route, stage
+│   ├── eventbridge.tf          # Warm-up rules (scan retries handled by SQS + DLQ)
+│   ├── cloudwatch.tf           # Log groups + alarms
+│   └── outputs.tf              # Webhook URL, bucket, topic, ECR repo URLs
 ├── lambda-webhook/             # Person A — webhook handler source
 │   ├── Dockerfile
 │   └── src/
-│       ├── index.js            # Handler: HMAC verify → create job → invoke scanner
+│       ├── index.js            # Handler: HMAC verify → create job → enqueue scan job
 │       ├── verify.js           # HMAC-SHA256 signature verification
 │       ├── jobStore.js         # S3 read/write for job metadata
-│       └── invoke.js           # Async Lambda-to-Lambda invocation
+│       └── invoke.js           # Enqueues the scan job onto SQS
 ├── lambda-scanner/             # Person B — SAST scanner source
 │   ├── Dockerfile
 │   ├── sast-engine/
 │   │   └── scanner.js          # Security rule engine (regex-based, 10 rule categories)
 │   └── src/
-│       ├── index.js            # Handler: download → scan → write report → EventBridge
+│       ├── index.js            # Handler (SQS-triggered): download → scan → write report
 │       ├── scanner.js          # Engine wrapper (normalises output to report schema)
 │       ├── jobStore.js         # S3 read/write for metadata and report
 │       └── githubClient.js     # GitHub tarball download + extraction
@@ -265,11 +285,13 @@ The scanner detects the following vulnerability types in JavaScript/TypeScript:
 | Resource | Name | Purpose |
 |----------|------|---------|
 | API Gateway (HTTP API) | `codeguard-webhook-api` | Public HTTPS endpoint for GitHub webhooks; invokes Lambda via service principal |
-| Lambda | `codeguard-webhook-handler` | Validates webhook, creates job, invokes scanner |
-| Lambda | `codeguard-sast-scanner` | Downloads repo, runs SAST, writes report |
+| Lambda | `codeguard-webhook-handler` | Validates webhook, creates job, enqueues scan job on SQS |
+| Lambda | `codeguard-sast-scanner` | Downloads repo, runs SAST, writes report (SQS-triggered) |
 | Lambda | `codeguard-notifier` | Posts PR comment, sends SNS alert |
+| SQS | `codeguard-scan-jobs` | Buffers scan jobs; triggers the scanner with redelivery on failure |
+| SQS | `codeguard-scan-dlq` | Dead-letter queue for scans that failed 3 times |
 | S3 | `codeguard-reports-{account}` | Stores job metadata and scan reports |
-| SNS | `codeguard-alerts` | Email alerts for HIGH-severity findings |
+| SNS | `codeguard-alerts` | Email alerts for HIGH-severity findings + DLQ alarm |
 | ECR | `codeguard-webhook-handler` | Docker image for webhook Lambda |
 | ECR | `codeguard-sast-scanner` | Docker image for scanner Lambda |
 | SSM | `/codeguard/github-webhook-secret` | Webhook HMAC secret |
@@ -286,13 +308,12 @@ All Lambdas run in a private VPC subnet with a NAT Gateway for outbound internet
 ```json
 {
   "jobId": "uuid",
-  "status": "PENDING | SUCCESS | FAILED | RETRYING | PERMANENTLY_FAILED",
+  "status": "PENDING | SUCCESS | FAILED",
   "repo": "owner/repo-name",
   "commitSha": "40-char SHA",
   "branch": "main",
   "prNumber": 42,
-  "triggeredAt": "ISO-8601",
-  "retryCount": 0
+  "triggeredAt": "ISO-8601"
 }
 ```
 
