@@ -1,0 +1,7 @@
+# Copy to terraform.tfvars and fill in before deploying.
+# Account ID is detected automatically from your AWS credentials.
+
+notification_email = "you@example.com"
+
+# Optional overrides (defaults shown):
+# aws_region = "us-east-1"
