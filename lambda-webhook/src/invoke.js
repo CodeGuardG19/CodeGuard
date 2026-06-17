@@ -1,51 +1,47 @@
 'use strict';
 
-const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
+const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
 const { updateJob } = require('./jobStore');
 
-const lambda = new LambdaClient({ region: process.env.AWS_REGION_NAME });
-const SAST_LAMBDA_NAME = process.env.SAST_LAMBDA_NAME;
+const sqs = new SQSClient({ region: process.env.AWS_REGION_NAME });
+const SCAN_QUEUE_URL = process.env.SCAN_QUEUE_URL;
 
 /**
- * Asynchronously invokes Person B's SAST Scanner Lambda.
+ * Enqueues a scan job onto SQS. The scanner consumes the queue via an event
+ * source mapping; SQS durably buffers the job and its visibility-timeout
+ * redelivery + dead-letter queue handle retries (replacing the old
+ * fire-and-forget Lambda invoke and the EventBridge SCAN_FAILED loop).
  *
- * InvocationType=Event means fire-and-forget — we do not wait for the scan
- * to complete. Lambda's built-in async retry (MaximumRetryAttempts=2) handles
- * transient failures; EventBridge handles structured retry on SCAN_FAILED events.
- *
- * On invocation failure we mark the job FAILED in S3 so EventBridge can pick
- * it up, then re-throw so the Lambda runtime records the error.
+ * On enqueue failure we mark the job FAILED in S3, then re-throw so the caller
+ * can surface the error to GitHub (which will redeliver the webhook).
  *
  * @param {string} jobId
  * @param {string} repo - "owner/repo" format
  * @param {string} commitSha
  */
-async function invokeSastScanner(jobId, repo, commitSha) {
-  const payload = JSON.stringify({ jobId, repo, commitSha });
-
+async function enqueueScanJob(jobId, repo, commitSha) {
   try {
-    await lambda.send(new InvokeCommand({
-      FunctionName: SAST_LAMBDA_NAME,
-      InvocationType: 'Event',
-      Payload: Buffer.from(payload),
+    await sqs.send(new SendMessageCommand({
+      QueueUrl: SCAN_QUEUE_URL,
+      MessageBody: JSON.stringify({ jobId, repo, commitSha }),
     }));
   } catch (err) {
     await updateJob(jobId, {
       status: 'FAILED',
-      failureReason: `SAST Scanner invocation failed: ${err.message}`,
+      failureReason: `Failed to enqueue scan job: ${err.message}`,
     }).catch((s3Err) => {
       console.error(JSON.stringify({
-        message: 'Failed to write FAILED status to S3 after invocation error',
+        message: 'Failed to write FAILED status to S3 after enqueue error',
         jobId,
         error: s3Err.message,
       }));
     });
 
-    const error = new Error(`SAST Scanner invocation failed for jobId=${jobId}: ${err.message}`);
+    const error = new Error(`Failed to enqueue scan job for jobId=${jobId}: ${err.message}`);
     error.jobId = jobId;
     error.cause = err;
     throw error;
   }
 }
 
-module.exports = { invokeSastScanner };
+module.exports = { enqueueScanJob };

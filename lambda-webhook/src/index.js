@@ -1,16 +1,13 @@
 'use strict';
 
 const { SSMClient, GetParameterCommand } = require('@aws-sdk/client-ssm');
-const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
 const { v4: uuidv4 } = require('uuid');
 const { verifySignature } = require('./verify');
-const { createJob, getJob, updateJob } = require('./jobStore');
-const { invokeSastScanner } = require('./invoke');
+const { createJob } = require('./jobStore');
+const { enqueueScanJob } = require('./invoke');
 
 const ssm = new SSMClient({ region: process.env.AWS_REGION_NAME });
-const sns = new SNSClient({ region: process.env.AWS_REGION_NAME });
 
-const SNS_TOPIC_ARN = process.env.SNS_TOPIC_ARN;
 const WEBHOOK_SECRET_PARAM = process.env.WEBHOOK_SECRET_PARAM;
 
 // Cached at cold start — avoids SSM round-trip on every invocation
@@ -35,12 +32,7 @@ exports.handler = async (event) => {
     return { statusCode: 200, body: 'warm' };
   }
 
-  // ── 2. Retry event (EventBridge SCAN_FAILED rule) ─────────────────────────
-  if (event['detail-type'] === 'SCAN_FAILED' && event.source === 'codeguard.scanner') {
-    return handleRetry(event.detail);
-  }
-
-  // ── 3. GitHub webhook (via Nginx proxy) ───────────────────────────────────
+  // ── 2. GitHub webhook (via API Gateway) ───────────────────────────────────
   return handleWebhook(event);
 };
 
@@ -98,7 +90,6 @@ async function handleWebhook(event) {
     branch: branch || 'unknown',
     prNumber,
     triggeredAt: new Date().toISOString(),
-    retryCount: 0,
   };
 
   try {
@@ -108,10 +99,15 @@ async function handleWebhook(event) {
     return { statusCode: 500, body: 'Failed to initialise scan job' };
   }
 
-  // Fire-and-forget — do not await the scan result
-  invokeSastScanner(jobId, repo, commitSha).catch((err) => {
-    console.error(JSON.stringify({ message: 'SAST invocation error', jobId, error: err.message }));
-  });
+  // Enqueue the scan job. SQS buffers it durably and triggers the scanner;
+  // its visibility-timeout redelivery + DLQ handle retries. If the enqueue
+  // itself fails, tell GitHub so it redelivers the webhook.
+  try {
+    await enqueueScanJob(jobId, repo, commitSha);
+  } catch (err) {
+    console.error(JSON.stringify({ message: 'Failed to enqueue scan job', jobId, error: err.message }));
+    return { statusCode: 502, body: 'Failed to enqueue scan job' };
+  }
 
   console.log(JSON.stringify({ message: 'Webhook accepted', jobId, repo, commitSha }));
 
@@ -119,48 +115,4 @@ async function handleWebhook(event) {
     statusCode: 202,
     body: JSON.stringify({ jobId, status: 'PENDING' }),
   };
-}
-
-// ── Retry handler ──────────────────────────────────────────────────────────────
-
-async function handleRetry(detail) {
-  const { jobId } = detail || {};
-  if (!jobId) {
-    console.error(JSON.stringify({ message: 'Retry event missing jobId', detail }));
-    return { statusCode: 400 };
-  }
-
-  let job;
-  try {
-    job = await getJob(jobId);
-  } catch (err) {
-    console.error(JSON.stringify({ message: 'Failed to read job for retry', jobId, error: err.message }));
-    return { statusCode: 500 };
-  }
-
-  if (job.retryCount >= 3) {
-    console.warn(JSON.stringify({ message: 'Job reached max retries, marking PERMANENTLY_FAILED', jobId, retryCount: job.retryCount }));
-    await updateJob(jobId, { status: 'PERMANENTLY_FAILED' }).catch((e) =>
-      console.error(JSON.stringify({ message: 'Failed to update job to PERMANENTLY_FAILED', jobId, error: e.message }))
-    );
-
-    if (SNS_TOPIC_ARN) {
-      await sns.send(new PublishCommand({
-        TopicArn: SNS_TOPIC_ARN,
-        Subject: `CodeGuard: Scan permanently failed for ${job.repo}`,
-        Message: JSON.stringify({ jobId, repo: job.repo, commitSha: job.commitSha, retryCount: job.retryCount }),
-      })).catch((e) =>
-        console.error(JSON.stringify({ message: 'SNS publish failed', jobId, error: e.message }))
-      );
-    }
-    return { statusCode: 200 };
-  }
-
-  const newRetryCount = job.retryCount + 1;
-  await updateJob(jobId, { status: 'RETRYING', retryCount: newRetryCount });
-  console.log(JSON.stringify({ message: 'Retrying scan', jobId, retryCount: newRetryCount }));
-
-  await invokeSastScanner(jobId, job.repo, job.commitSha);
-
-  return { statusCode: 200 };
 }
